@@ -7,3 +7,4 @@ deploy/config.json
 aqos-agent-runs/
 .kilo/
 tmp/
+deploy/credential-ids.json

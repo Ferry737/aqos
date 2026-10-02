@@ -143,6 +143,21 @@ The risk limits in `risk.limits` must be calibrated and approved by a risk commi
 </details>
 
 <details>
+<summary><b>Deploy to n8n Cloud (no command line needed)</b></summary>
+
+n8n Cloud has no CLI, and an API or UI import assigns new workflow ids, which would break every sub-workflow link. `tools/deploy-n8n-cloud.mjs` imports through the public API and rewrites the links:
+
+1. In n8n: **Settings → n8n API → Create an API key**. Keep it in your shell only.
+2. Cloud can't reach `localhost`: create a hosted PostgreSQL and Redis, load `db/schema.sql`, and note that the service hostnames in the workflows (`ems`, `risk-svc`, ...) need public URLs or stubs.
+3. ```bash
+   N8N_BASE_URL=https://<you>.app.n8n.cloud N8N_API_KEY=<key> node tools/deploy-n8n-cloud.mjs --credentials
+   ```
+   Add `--activate` to publish. `--dry` shows the plan without any network. Re-running updates, never duplicates.
+4. Open each credential in n8n and replace the `REPLACE_ME` placeholders with real secrets.
+
+</details>
+
+<details>
 <summary><b>Repository layout</b></summary>
 
 ```
