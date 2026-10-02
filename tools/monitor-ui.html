@@ -206,7 +206,7 @@ function connect(){
   es.addEventListener('state',e=>applyState(JSON.parse(e.data)));
   es.addEventListener('lines',e=>{const d=JSON.parse(e.data);onLines(d.task,d.lines)});
 }
-connect();
+if(window.__SNAP__){applyState(window.__SNAP__.state);for(const l of window.__SNAP__.lines)onLines(l.task,l.lines);$("#conn").textContent="snapshot"}else connect();
 </script>
 </body>
 </html>

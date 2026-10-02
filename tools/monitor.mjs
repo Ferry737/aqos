@@ -2,6 +2,7 @@
 // Obsidian Logs: live, per-second stream of the free-model agent team.
 //   node tools/monitor.mjs [runsDir] [--port 8787]      then open http://127.0.0.1:8787
 // Server-Sent Events: new log lines are pushed every 500 ms, task state every 2 s.
+// /snapshot renders the same UI once, without an open stream (for screenshots).
 // Local only (127.0.0.1). UI is tools/monitor-ui.html.
 import http from 'node:http';
 import { readFileSync, existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
@@ -40,8 +41,7 @@ function snapshot() {
   const sup = superseded();
   const tasks = Object.entries(sp).map(([id, s]) => taskState(id, s, plog));
   const archived = Object.entries(sup).map(([id, by]) => ({ id, state: 'gave up', replacedBy: by, resolved: by.every((b) => tasks.find((t) => t.id === b)?.state === 'accepted') }));
-  return { now: Date.now(), finished: plog.filter((l) => l.includes('pipeline finished')).length >= Math.max(1, plog.filter((l) => /pipeline finished/.test(l)).length), tasks, archived,
-    pipelineFinished: plog.some((l) => l.includes('pipeline finished')) };
+  return { now: Date.now(), tasks, archived, pipelineFinished: plog.some((l) => l.includes('pipeline finished')) };
 }
 
 // Incremental tailer per connection.
@@ -78,6 +78,15 @@ http.createServer((req, res) => {
     const t2 = setInterval(() => { try { send('state', snapshot()); } catch (e) { send('err', String(e)); } }, 2000);
     const t3 = setInterval(() => res.write(': ping\n\n'), 15000);
     req.on('close', () => { clearInterval(t1); clearInterval(t2); clearInterval(t3); });
+    return;
+  }
+  if (req.url.startsWith('/snapshot')) {
+    const ids = [...Object.keys(specs()), ...Object.keys(superseded())];
+    const files = [['pipeline', join(RUNS, 'pipeline.log')], ...ids.map((id) => [id, join(RUNS, id, 'log')])];
+    const lines = files.map(([task, f]) => ({ task, lines: strip(read(f)).split('\n').filter((l) => l.trim()).slice(-14) }));
+    const data = JSON.stringify({ state: snapshot(), lines }).replace(/</g, '\\x3c');
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+    res.end(ui().replace('<script>', () => `<script>window.__SNAP__=${data};`));
     return;
   }
   res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });

@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="AQOS logo">
+  <defs>
+    <linearGradient id="face" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#d7c9ff"/><stop offset=".5" stop-color="#8a67ff"/><stop offset="1" stop-color="#2b1a7a"/>
+    </linearGradient>
+    <linearGradient id="top" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#efe8ff"/><stop offset="1" stop-color="#a58cff"/>
+    </linearGradient>
+    <radialGradient id="glow" cx=".5" cy=".5" r=".5">
+      <stop offset="0" stop-color="#8a67ff" stop-opacity=".55"/><stop offset="1" stop-color="#8a67ff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <circle cx="64" cy="66" r="60" fill="url(#glow)"/>
+  <path d="M64 8 108 44 92 116H36L20 44Z" fill="url(#face)"/>
+  <path d="M64 8 108 44H20Z" fill="url(#top)" opacity=".9"/>
+  <path d="M20 44 64 44 36 116Z" fill="#000" opacity=".16"/>
+  <path d="M108 44 64 44 92 116Z" fill="#fff" opacity=".1"/>
+  <path d="M64 8V44M20 44H108M36 116 64 44 92 116" stroke="#fff" stroke-opacity=".4" stroke-width="1.6" fill="none"/>
+  <path d="M40 80h14l6-14 10 26 7-18h11" stroke="#3ddc97" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+</svg>

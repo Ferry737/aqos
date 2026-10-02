@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 340" width="1280" height="340" role="img" aria-label="AQOS: Agentic Quant OS banner">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#07070b"/><stop offset=".55" stop-color="#120f26"/><stop offset="1" stop-color="#1b1240"/>
+    </linearGradient>
+    <radialGradient id="halo" cx=".18" cy=".5" r=".5">
+      <stop offset="0" stop-color="#8a67ff" stop-opacity=".45"/><stop offset="1" stop-color="#8a67ff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="face" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#d7c9ff"/><stop offset=".5" stop-color="#8a67ff"/><stop offset="1" stop-color="#2b1a7a"/>
+    </linearGradient>
+    <linearGradient id="top" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#efe8ff"/><stop offset="1" stop-color="#a58cff"/></linearGradient>
+    <linearGradient id="title" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#b9a6ff"/></linearGradient>
+    <linearGradient id="beat" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#3ddc97" stop-opacity="0"/><stop offset=".25" stop-color="#3ddc97"/><stop offset="1" stop-color="#6fd3ff"/>
+    </linearGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0H0V40" fill="none" stroke="#9b7bff" stroke-opacity=".07"/>
+    </pattern>
+    <mask id="fade"><rect width="1280" height="340" fill="url(#fm)"/></mask>
+    <linearGradient id="fm" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff"/><stop offset="1" stop-color="#fff" stop-opacity=".1"/></linearGradient>
+  </defs>
+  <style>
+    .sans{font-family:Inter,"Segoe UI",system-ui,-apple-system,sans-serif}
+    .mono{font-family:ui-monospace,"Cascadia Code","SFMono-Regular",Menlo,Consolas,monospace}
+    .draw{stroke-dasharray:900;stroke-dashoffset:900;animation:draw 3.2s ease-out infinite}
+    @keyframes draw{0%{stroke-dashoffset:900;opacity:1}55%{stroke-dashoffset:0;opacity:1}85%{stroke-dashoffset:0;opacity:.0}100%{stroke-dashoffset:900;opacity:0}}
+    .pulse{animation:pulse 1.6s ease-out infinite;transform-origin:center;transform-box:fill-box}
+    @keyframes pulse{0%{transform:scale(1);opacity:.9}100%{transform:scale(3.4);opacity:0}}
+    .gem{animation:float 6s ease-in-out infinite}
+    @keyframes float{50%{transform:translateY(-6px)}}
+    @media (prefers-reduced-motion:reduce){.draw,.pulse,.gem{animation:none;stroke-dashoffset:0}}
+  </style>
+  <rect width="1280" height="340" fill="url(#bg)"/>
+  <rect width="1280" height="340" fill="url(#grid)" mask="url(#fade)"/>
+  <rect width="1280" height="340" fill="url(#halo)"/>
+
+  <g transform="translate(70 62) scale(1.75)"><g class="gem">
+    <path d="M64 8 108 44 92 116H36L20 44Z" fill="url(#face)" transform="scale(.8) translate(0 0)"/>
+    <path d="M64 8 108 44H20Z" fill="url(#top)" opacity=".9" transform="scale(.8)"/>
+    <path d="M20 44 64 44 36 116Z" fill="#000" opacity=".16" transform="scale(.8)"/>
+    <path d="M108 44 64 44 92 116Z" fill="#fff" opacity=".1" transform="scale(.8)"/>
+    <path d="M64 8V44M20 44H108M36 116 64 44 92 116" stroke="#fff" stroke-opacity=".4" stroke-width="1.6" fill="none" transform="scale(.8)"/>
+    <path d="M40 80h14l6-14 10 26 7-18h11" stroke="#3ddc97" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round" fill="none" transform="scale(.8)"/>
+  </g></g>
+
+  <text x="250" y="150" class="sans" font-size="104" font-weight="800" letter-spacing="10" fill="url(#title)">AQOS</text>
+  <text x="254" y="196" class="sans" font-size="26" font-weight="500" fill="#c9c2ea">Agentic Quant OS</text>
+  <text x="254" y="234" class="mono" font-size="15" fill="#8b88a6" letter-spacing=".6">AI-native, 24/7 control plane for systematic crypto trading</text>
+  <g class="mono" font-size="12.5" fill="#cfc8f5">
+    <rect x="254" y="258" width="132" height="28" rx="14" fill="#ffffff" fill-opacity=".06" stroke="#9b7bff" stroke-opacity=".35"/><text x="320" y="277" text-anchor="middle">n8n control plane</text>
+    <rect x="398" y="258" width="150" height="28" rx="14" fill="#ffffff" fill-opacity=".06" stroke="#9b7bff" stroke-opacity=".35"/><text x="473" y="277" text-anchor="middle">Postgres invariants</text>
+    <rect x="560" y="258" width="132" height="28" rx="14" fill="#ffffff" fill-opacity=".06" stroke="#9b7bff" stroke-opacity=".35"/><text x="626" y="277" text-anchor="middle">risk-first design</text>
+  </g>
+
+  <g transform="translate(830 0)">
+    <text x="0" y="96" class="mono" font-size="12" fill="#6e6b88" letter-spacing="2">SYSTEM HEARTBEAT · SUPERVISOR · 30 s</text>
+    <g transform="scale(.8 1)">
+      <path class="draw" d="M0 190H70l14-34 20 78 22-100 20 56h40l12-24 16 48 14-24h46l14-30 16 60 14-30H520" fill="none" stroke="url(#beat)" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+    <circle cx="416" cy="190" r="6" fill="#6fd3ff"/>
+    <circle class="pulse" cx="416" cy="190" r="6" fill="#6fd3ff"/>
+    <text x="0" y="262" class="mono" font-size="12" fill="#6e6b88">an illustration of liveness, not data</text>
+  </g>
+</svg>
