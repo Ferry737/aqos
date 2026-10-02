@@ -1,0 +1,453 @@
+{
+  "id": "AQOS12ClientRepo",
+  "name": "AQOS-12 Client reports",
+  "active": true,
+  "nodes": [
+    {
+      "id": "08c4a6ca-617b-4795-8731-bbd6068512f7",
+      "name": "Daily reports 01:00 UTC",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 0 1 * * *"
+            }
+          ]
+        },
+        "misfirePolicy": "coalesce_owner",
+        "misfireGraceSeconds": 7200
+      }
+    },
+    {
+      "id": "c808e6a2-fb1a-47d3-8184-2d302a938cbb",
+      "name": "Reports due",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        280,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM biz.reports_due($1::jsonb)",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({}) }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "aqosCredPgMain00",
+          "name": "AQOS Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "5d31638b-0cac-4146-861c-da8a3d7a08ab",
+      "name": "Batches of 20",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        16240,
+        0
+      ],
+      "parameters": {
+        "batchSize": 20,
+        "options": {}
+      }
+    },
+    {
+      "id": "e8ba4637-0dd1-4ba9-827e-a2baad8c77e1",
+      "name": "Build narrative request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        16520,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// --- shared: Claude Messages API helpers (inlined at build time) -----------\n// One model for every LLM route; effort is tuned per route. Structured outputs\n// (output_config.format) guarantee schema-valid JSON. Server-side fallbacks\n// re-run a declined request on Anthropic's recommended fallback model.\n// Any refusal, truncation, HTTP error or bad JSON returns ok=false so the\n// caller takes its deterministic path: no LLM sits on a path that moves money.\nconst CLAUDE_MODEL = 'claude-opus-5-5';\nfunction claudeRequest({ system, user, schema, effort = 'low', maxTokens = 8000 }) {\n  return {\n    model: CLAUDE_MODEL,\n    max_tokens: maxTokens,\n    fallbacks: 'default',\n    system,\n    output_config: { effort, format: { type: 'json_schema', schema } },\n    messages: [{ role: 'user', content: typeof user === 'string' ? user : JSON.stringify(user) }],\n  };\n}\nfunction parseClaude(item) {\n  if (!item) return { ok: false, reason: 'no_response' };\n  if (item.error) return { ok: false, reason: 'http_error', detail: String(item.error.message ?? item.error).slice(0, 300) };\n  const status = item.statusCode;\n  const msg = item.body ?? item;\n  if (status && (status < 200 || status >= 300)) return { ok: false, reason: `http_${status}`, detail: msg?.error?.type ?? null };\n  if (msg?.stop_reason === 'refusal') return { ok: false, reason: 'refusal', detail: msg.stop_details?.category ?? null };\n  if (msg?.stop_reason === 'max_tokens') return { ok: false, reason: 'max_tokens' };\n  const text = (msg?.content ?? []).filter((b) => b.type === 'text').map((b) => b.text).join('');\n  try {\n    return { ok: true, data: JSON.parse(text), model: msg.model ?? CLAUDE_MODEL, usage: msg.usage ?? null };\n  } catch {\n    return { ok: false, reason: 'invalid_json' };\n  }\n}\n// --- end shared --------------------------------------------------------------\n\n// Communication agent. It writes from the client's own metrics only. A\n// deterministic compliance gate checks the draft before anything is sent;\n// tables and the disclosure footer are rendered by code, not by the model.\nconst schema = {\n  type: 'object',\n  additionalProperties: false,\n  required: ['subject', 'summary_md', 'highlights', 'risk_notes'],\n  properties: {\n    subject: { type: 'string' },\n    summary_md: { type: 'string' },\n    highlights: { type: 'array', items: { type: 'string' } },\n    risk_notes: { type: 'array', items: { type: 'string' } },\n  },\n};\nconst system = [\n  'You write a short, factual daily account summary for a client of a crypto trading software platform.',\n  'Use only the numbers in the data, copied exactly (you may round to two decimals). Describe what happened; do not',\n  'predict, promise or imply future results. Never recommend buying, selling, holding or changing allocations,',\n  'and never describe trading as safe, guaranteed or low-risk. Mention any risk-mode changes plainly.',\n  'Keep summary_md under 120 words, with no links and no headings. Subject under 70 characters.',\n].join(' ');\nreturn $input.all().map((it) => ({\n  json: {\n    ...it.json,\n    anthropic_request: claudeRequest({ system, user: { period: it.json.period, metrics: it.json.metrics }, schema, effort: 'medium', maxTokens: 6000 }),\n  },\n}));\n"
+      }
+    },
+    {
+      "id": "2a370f3a-3707-4a82-806c-91508481725d",
+      "name": "Claude narrative",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        14560,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "anthropicApi",
+        "sendHeaders": true,
+        "specifyHeaders": "keypair",
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "anthropic-beta",
+              "value": "server-side-fallback-2026-07-01"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.anthropic_request) }}",
+        "options": {
+          "timeout": 120000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "anthropicApi": {
+          "id": "aqosCredAnthrop00",
+          "name": "AQOS Anthropic"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "cf06d496-725e-443e-8109-0bab2b4b94bf",
+      "name": "Compliance gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        14840,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// --- shared: Claude Messages API helpers (inlined at build time) -----------\n// One model for every LLM route; effort is tuned per route. Structured outputs\n// (output_config.format) guarantee schema-valid JSON. Server-side fallbacks\n// re-run a declined request on Anthropic's recommended fallback model.\n// Any refusal, truncation, HTTP error or bad JSON returns ok=false so the\n// caller takes its deterministic path: no LLM sits on a path that moves money.\nconst CLAUDE_MODEL = 'claude-opus-5-5';\nfunction claudeRequest({ system, user, schema, effort = 'low', maxTokens = 8000 }) {\n  return {\n    model: CLAUDE_MODEL,\n    max_tokens: maxTokens,\n    fallbacks: 'default',\n    system,\n    output_config: { effort, format: { type: 'json_schema', schema } },\n    messages: [{ role: 'user', content: typeof user === 'string' ? user : JSON.stringify(user) }],\n  };\n}\nfunction parseClaude(item) {\n  if (!item) return { ok: false, reason: 'no_response' };\n  if (item.error) return { ok: false, reason: 'http_error', detail: String(item.error.message ?? item.error).slice(0, 300) };\n  const status = item.statusCode;\n  const msg = item.body ?? item;\n  if (status && (status < 200 || status >= 300)) return { ok: false, reason: `http_${status}`, detail: msg?.error?.type ?? null };\n  if (msg?.stop_reason === 'refusal') return { ok: false, reason: 'refusal', detail: msg.stop_details?.category ?? null };\n  if (msg?.stop_reason === 'max_tokens') return { ok: false, reason: 'max_tokens' };\n  const text = (msg?.content ?? []).filter((b) => b.type === 'text').map((b) => b.text).join('');\n  try {\n    return { ok: true, data: JSON.parse(text), model: msg.model ?? CLAUDE_MODEL, usage: msg.usage ?? null };\n  } catch {\n    return { ok: false, reason: 'invalid_json' };\n  }\n}\n// --- end shared --------------------------------------------------------------\n\n// Deterministic compliance gate for client communications:\n//  * banned phrases (performance promises, advice, hype)\n//  * every number in the draft must exist in the source metrics\n//    (anti-hallucination), after ignoring dates and small counts\n//  * no links, bounded length\n// A failing draft is replaced by the template-only report and flagged.\nconst BANNED = [\n  /guarantee/i, /risk[-\\s]?free/i, /can(?:'|no)?t lose/i, /\\bno[-\\s]?lose\\b/i, /sure[-\\s]?thing/i,\n  /will (?:earn|make|return|gain|profit|outperform|recover)/i, /expected (?:return|profit)s?\\b/i,\n  /\\byou should (?:buy|sell|hold|invest|increase|decrease|add|reduce)/i, /\\bwe (?:recommend|suggest|advise)\\b/i,\n  /\\bpassive income\\b/i, /\\bdouble your\\b/i, /\\bto the moon\\b/i, /\\bsafe (?:bet|investment|returns?)\\b/i,\n];\n\nfunction numbersInText(text) {\n  const cleaned = String(text)\n    .replace(/\\b\\d{4}-\\d{2}-\\d{2}(?:[T ][\\d:.]+Z?)?\\b/g, ' ')   // ISO dates and timestamps\n    .replace(/\\b\\d{1,2}:\\d{2}(?::\\d{2})?\\b/g, ' ');            // clock times\n  return (cleaned.match(/-?\\$?\\d[\\d,]*(?:\\.\\d+)?%?/g) ?? [])\n    .map((s) => Number(s.replace(/[$,%]/g, '')))\n    .filter(Number.isFinite);\n}\nfunction collectNumbers(obj, out = []) {\n  if (obj === null || obj === undefined) return out;\n  if (typeof obj === 'number') out.push(obj);\n  else if (typeof obj === 'string' && /^-?\\d+(?:\\.\\d+)?$/.test(obj.trim())) out.push(Number(obj));\n  else if (Array.isArray(obj)) obj.forEach((v) => collectNumbers(v, out));\n  else if (typeof obj === 'object') Object.values(obj).forEach((v) => collectNumbers(v, out));\n  return out;\n}\nfunction supported(n, src) {\n  if (Number.isInteger(n) && Math.abs(n) <= 12) return true;       // counts, months, small integers\n  return src.some((s) => {\n    const close = (a, b) => Math.abs(a - b) <= Math.max(0.011, Math.abs(b) * 0.005);\n    return close(Math.abs(n), Math.abs(s)) || close(Math.abs(n), Math.abs(s * 100));   // value or percent form\n  });\n}\nfunction check(draft, metrics) {\n  const issues = [];\n  const text = [draft?.subject, draft?.summary_md, ...(draft?.highlights ?? []), ...(draft?.risk_notes ?? [])].join('\\n');\n  for (const re of BANNED) if (re.test(text)) issues.push(`banned_phrase:${re.source}`);\n  const src = collectNumbers(metrics);\n  const unsupported = numbersInText(text).filter((n) => !supported(n, src));\n  if (unsupported.length) issues.push(`unsupported_numbers:${unsupported.slice(0, 5).join(',')}`);\n  if (/https?:\\/\\/|www\\./i.test(text)) issues.push('contains_link');\n  if (String(draft?.summary_md ?? '').length > 1200) issues.push('too_long');\n  if (String(draft?.subject ?? '').length > 90) issues.push('subject_too_long');\n  return { pass: issues.length === 0, issues };\n}\n\nconst requests = $('Build narrative request').all();\nreturn $input.all().map((it, i) => {\n  const src = { ...(requests[i]?.json ?? {}) };\n  delete src.anthropic_request;\n  const t = parseClaude(it.json);\n  const result = t.ok ? check(t.data, src.metrics) : { pass: false, issues: [`llm_unavailable:${t.reason}`] };\n  return { json: { ...src, draft: t.ok ? t.data : null, compliance: { ...result, model: t.ok ? t.model : null } } };\n});\n"
+      }
+    },
+    {
+      "id": "0f395bd8-914d-4fe8-86d2-037b5d19682d",
+      "name": "Render email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        15120,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Renders the report. Tables and the disclosure footer come from code; the\n// model's narrative is used only if it passed the compliance gate.\nconst DISCLOSURE_VERSION = '2026.09';\nconst esc = (s) => String(s ?? '').replace(/[&<>\"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', \"'\": '&#39;' }[c]));\nconst md = (s) => esc(s)\n  .split(/\\n{2,}/)\n  .map((p) => (/^\\s*[-*] /m.test(p)\n    ? `<ul>${p.split('\\n').filter((l) => l.trim()).map((l) => `<li>${l.replace(/^\\s*[-*] /, '')}</li>`).join('')}</ul>`\n    : `<p>${p.replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>').replace(/\\n/g, '<br>')}</p>`))\n  .join('');\nconst usd = (x) => (x === null || x === undefined ? 'n/a' : `USD ${Number(x).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`);\n\nreturn $input.all().map(({ json: r }) => {\n  const accounts = r.metrics?.accounts ?? [];\n  const breakers = r.metrics?.breaker_events ?? [];\n  const rows = accounts.map((a) => `<tr><td>${esc(a.account_id)}</td><td>${esc(a.venue)}</td><td>${usd(a.equity_usd)}</td>`\n    + `<td>${usd(a.day_change_usd)}</td><td>${usd(a.fees_usd)}</td><td>${usd(a.funding_usd)}</td><td>${esc(a.risk_mode)}</td></tr>`).join('');\n  const narrative = r.compliance?.pass && r.draft\n    ? md(r.draft.summary_md)\n    : '<p>Your daily account summary is below. Figures come directly from your connected exchange accounts.</p>';\n  const breakerList = breakers.length\n    ? `<p><strong>Risk controls that acted:</strong></p><ul>${breakers.map((b) => `<li>${esc(b.ts)} ${esc(b.tier)} ${esc(b.metric ?? '')} ${esc(b.action ?? '')}</li>`).join('')}</ul>`\n    : '';\n  const subject = r.compliance?.pass && r.draft?.subject ? r.draft.subject : `Your AQOS account summary for ${r.period}`;\n  const html = [\n    `<p>Account summary for ${esc(r.period)} (UTC). Mode: ${esc(r.metrics?.mode ?? '')}.</p>`,\n    narrative,\n    '<table cellpadding=\"6\" style=\"border-collapse:collapse\" border=\"1\"><tr><th>Account</th><th>Venue</th><th>Equity</th>'\n      + `<th>Day change</th><th>Fees</th><th>Funding</th><th>Risk mode</th></tr>${rows}</table>`,\n    breakerList,\n    `<p style=\"font-size:12px;color:#555\">This report is generated by software from data in exchange accounts you control. `\n      + 'It is not investment advice or a recommendation. Past results do not indicate future results. Digital assets are volatile '\n      + `and you can lose all capital allocated to trading. Disclosures v${DISCLOSURE_VERSION}.</p>`,\n  ].join('\\n');\n  return { json: { ...r, to: r.email, subject: subject.slice(0, 90), html, hash_input: `${r.client_id}|${r.period}|${html}` } };\n});\n"
+      }
+    },
+    {
+      "id": "e8d367cd-4974-4f80-886b-d68f38916dd7",
+      "name": "Content hash",
+      "type": "n8n-nodes-base.crypto",
+      "typeVersion": 2,
+      "position": [
+        15400,
+        0
+      ],
+      "parameters": {
+        "action": "hash",
+        "binaryData": false,
+        "type": "SHA256",
+        "value": "={{ $json.hash_input }}",
+        "dataPropertyName": "content_sha256",
+        "encoding": "hex"
+      }
+    },
+    {
+      "id": "06bbb669-dcb7-4fa8-8aed-194c63bfefe3",
+      "name": "Send report",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        15680,
+        0
+      ],
+      "parameters": {
+        "fromEmail": "AQOS <no-reply@example.com>",
+        "toEmail": "={{ $(\"Content hash\").item.json.to }}",
+        "subject": "={{ $(\"Content hash\").item.json.subject }}",
+        "emailFormat": "html",
+        "html": "={{ $(\"Content hash\").item.json.html }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "credentials": {
+        "smtp": {
+          "id": "aqosCredSmtp00000",
+          "name": "AQOS SMTP"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "id": "6707281e-2245-496a-8f19-17a95dc93d24",
+      "name": "Record report",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        15960,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT biz.record_report($1::jsonb) AS r",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ client_id: $(\"Content hash\").item.json.client_id, period: $(\"Content hash\").item.json.period, content_sha256: $(\"Content hash\").item.json.content_sha256, llm_model: $(\"Content hash\").item.json.compliance.model, compliance: $(\"Content hash\").item.json.compliance }) }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "aqosCredPgMain00",
+          "name": "AQOS Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "6f463286-fcf6-446c-89fd-35408e5a1244",
+      "name": "Count run results",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        16520,
+        150
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT count(*)::int AS sent, count(*) FILTER (WHERE (compliance->>'pass')::boolean IS NOT TRUE)::int AS fallback FROM biz.reports WHERE sent_at > now() - interval '3 hours'",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "aqosCredPgMain00",
+          "name": "AQOS Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000,
+      "executeOnce": true
+    },
+    {
+      "id": "975b56ac-084f-4a33-8786-3baf0096938f",
+      "name": "Run summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        14560,
+        150
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// End-of-run summary for the ops channel, counted from the database so it\n// covers every batch of the loop.\nconst r = $input.first().json;\nconst sent = Number(r.sent ?? 0);\nconst fallback = Number(r.fallback ?? 0);\nreturn [{ json: { severity: 'INFO', text: `[REPORTS] ${sent} report(s) recorded in this run, ${fallback} used the template fallback` } }];\n"
+      }
+    },
+    {
+      "id": "379afac1-1732-4904-823e-14ca00f42a50",
+      "name": "Notify",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.4,
+      "position": [
+        14840,
+        150
+      ],
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "AQOS16Notifier00",
+          "mode": "id"
+        },
+        "mode": "once",
+        "options": {
+          "waitForSubWorkflow": false
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Daily reports 01:00 UTC": {
+      "main": [
+        [
+          {
+            "node": "Reports due",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reports due": {
+      "main": [
+        [
+          {
+            "node": "Batches of 20",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Batches of 20": {
+      "main": [
+        [
+          {
+            "node": "Count run results",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build narrative request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build narrative request": {
+      "main": [
+        [
+          {
+            "node": "Claude narrative",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude narrative": {
+      "main": [
+        [
+          {
+            "node": "Compliance gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compliance gate": {
+      "main": [
+        [
+          {
+            "node": "Render email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Render email": {
+      "main": [
+        [
+          {
+            "node": "Content hash",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Content hash": {
+      "main": [
+        [
+          {
+            "node": "Send report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send report": {
+      "main": [
+        [
+          {
+            "node": "Record report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record report": {
+      "main": [
+        [
+          {
+            "node": "Batches of 20",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Count run results": {
+      "main": [
+        [
+          {
+            "node": "Run summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run summary": {
+      "main": [
+        [
+          {
+            "node": "Notify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "UTC",
+    "saveDataErrorExecution": "all",
+    "saveManualExecutions": false,
+    "errorWorkflow": "AQOS13ErrorHandl",
+    "executionTimeout": 3600
+  },
+  "pinData": {},
+  "tags": [
+    {
+      "name": "aqos"
+    }
+  ],
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}

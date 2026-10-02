@@ -1,0 +1,147 @@
+{
+  "T-D-ingestion-tests": {
+    "deliverables": [
+      "tools/tests/ingestion.test.mjs"
+    ],
+    "accept": "node --test tools/tests/ingestion.test.mjs",
+    "minTests": 40,
+    "mutate": [
+      [
+        "wf01-feed-rules.js",
+        "tools/tests/ingestion.test.mjs"
+      ],
+      [
+        "wf02-normalize-funding.js",
+        "tools/tests/ingestion.test.mjs"
+      ],
+      [
+        "wf02-sentiment-result.js",
+        "tools/tests/ingestion.test.mjs"
+      ],
+      [
+        "wf01-dq-triage-result.js",
+        "tools/tests/ingestion.test.mjs"
+      ]
+    ]
+  },
+  "T-F-portfolio-research-tests": {
+    "deliverables": [
+      "tools/tests/portfolio-research.test.mjs"
+    ],
+    "accept": "node --test tools/tests/portfolio-research.test.mjs",
+    "minTests": 30,
+    "mutate": [
+      [
+        "wf08-decide-path.js",
+        "tools/tests/portfolio-research.test.mjs"
+      ],
+      [
+        "wf08-prepare-proposals.js",
+        "tools/tests/portfolio-research.test.mjs"
+      ],
+      [
+        "wf09-digest.js",
+        "tools/tests/portfolio-research.test.mjs"
+      ]
+    ]
+  },
+  "T-G-openapi-contracts": {
+    "deliverables": [
+      "docs/openapi/ems.json",
+      "docs/openapi/services.json"
+    ],
+    "accept": "node tools/check-openapi.mjs docs/openapi",
+    "minTests": 0,
+    "mutate": []
+  },
+  "T-H-stub-services": {
+    "deliverables": [
+      "tools/stub-services.mjs",
+      "tools/tests/stub-services.test.mjs",
+      "deploy/docker-compose.stubs.yml"
+    ],
+    "accept": "node --test tools/tests/stub-services.test.mjs",
+    "minTests": 18,
+    "mutate": []
+  },
+  "T-E1-onboarding-tests": {
+    "deliverables": [
+      "tools/tests/onboarding.test.mjs"
+    ],
+    "accept": "node --test tools/tests/onboarding.test.mjs",
+    "minTests": 22,
+    "mutate": [
+      [
+        "wf10-validate-signup.js",
+        "tools/tests/onboarding.test.mjs"
+      ],
+      [
+        "wf10-key-policy.js",
+        "tools/tests/onboarding.test.mjs"
+      ],
+      [
+        "wf10-screening-outcome.js",
+        "tools/tests/onboarding.test.mjs"
+      ]
+    ]
+  },
+  "T-E2-billing-tests": {
+    "deliverables": [
+      "tools/tests/billing.test.mjs"
+    ],
+    "accept": "node --test tools/tests/billing.test.mjs",
+    "minTests": 15,
+    "mutate": [
+      [
+        "wf11-billing-message.js",
+        "tools/tests/billing.test.mjs"
+      ],
+      [
+        "wf11-normalize-stripe.js",
+        "tools/tests/billing.test.mjs"
+      ]
+    ]
+  },
+  "T-I1-gate-exec-tests": {
+    "deliverables": [
+      "tools/tests/plumbing-gate-exec.test.mjs"
+    ],
+    "accept": "node --test tools/tests/plumbing-gate-exec.test.mjs",
+    "minTests": 18,
+    "mutate": [
+      [
+        "wf06-break-policy.js",
+        "tools/tests/plumbing-gate-exec.test.mjs"
+      ],
+      [
+        "wf04-collect-escalations.js",
+        "tools/tests/plumbing-gate-exec.test.mjs"
+      ],
+      [
+        "wf05-ems-batch.js",
+        "tools/tests/plumbing-gate-exec.test.mjs"
+      ]
+    ]
+  },
+  "T-I2-monitor-tests": {
+    "deliverables": [
+      "tools/tests/plumbing-monitor.test.mjs"
+    ],
+    "accept": "node --test tools/tests/plumbing-monitor.test.mjs",
+    "minTests": 14,
+    "mutate": [
+      [
+        "wf07-dedupe-alert.js",
+        "tools/tests/plumbing-monitor.test.mjs"
+      ],
+      [
+        "wf07-plan-followups.js",
+        "tools/tests/plumbing-monitor.test.mjs"
+      ],
+      [
+        "wf07-normalize-snapshot.js",
+        "tools/tests/plumbing-monitor.test.mjs"
+      ]
+    ]
+  }
+}

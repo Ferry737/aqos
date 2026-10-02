@@ -1,0 +1,392 @@
+{
+  "id": "AQOS04RiskGate00",
+  "name": "AQOS-04 Risk gate",
+  "active": false,
+  "nodes": [
+    {
+      "id": "d2bcc2ad-3f7a-4331-80dd-9f4a21014d84",
+      "name": "Proposals in",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "inputSource": "passthrough"
+      }
+    },
+    {
+      "id": "1183a267-d0b8-4e2f-8019-d97fa533d291",
+      "name": "Gate scope",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        280,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Scope of one gate call: which accounts and symbols to load context for.\nconst items = $input.all().map((i) => i.json);\nreturn [{\n  json: {\n    accounts: [...new Set(items.map((p) => p.account_id).filter(Boolean))],\n    symbols: [...new Set(items.map((p) => p.symbol).filter(Boolean))],\n    n: items.length,\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "7a278b3b-d58a-42d4-84e2-01692b208243",
+      "name": "Load risk context",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        560,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT risk.gate_context($1::jsonb) AS ctx",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify($json) }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "aqosCredPgMain00",
+          "name": "AQOS Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "3ffd0f1f-cbca-4233-8287-d528711996b0",
+      "name": "Global mode (fast flag)",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        840,
+        0
+      ],
+      "parameters": {
+        "operation": "get",
+        "propertyName": "redis_mode",
+        "key": "aqos:mode:global",
+        "keyType": "string"
+      },
+      "credentials": {
+        "redis": {
+          "id": "aqosCredRedis0000",
+          "name": "AQOS Redis"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 500,
+      "executeOnce": true
+    },
+    {
+      "id": "a1521571-5003-424b-832e-4464283ba167",
+      "name": "Pre-trade checks",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ===========================================================================\n// AQOS · WF-04 Risk Gate · Pre-trade checks (deterministic, fail-closed)\n//\n// One pass over every proposal in a cycle:\n//   * the most severe trading mode across global/venue/strategy/account wins\n//   * in-flight orders count as filled (no double exposure on retries)\n//   * exposure accumulates across the batch, so ten small orders cannot each\n//     consume the same headroom\n//   * strategy capacity is shared pro-rata, so no client gets priority\n//   * hedged pairs (pair_id) stay hedged: one rejected leg rejects the pair\n// Caps can only shrink an order. Missing or stale data rejects it.\n// The EMS re-applies the hard limits as the last line of defence.\n// ===========================================================================\nconst RANK = { NORMAL: 0, REDUCE_ONLY: 1, HALT: 2 };\nconst EPS = 1e-12;\nconst normMode = (m) => {\n  const u = String(m ?? 'NORMAL').toUpperCase();\n  return u in RANK ? u : 'HALT'; // unknown modes fail closed\n};\nconst worst = (...modes) => modes.map(normMode).reduce((a, b) => (RANK[b] > RANK[a] ? b : a), 'NORMAL');\nconst sgn = (side) => (side === 'BUY' ? 1 : -1);\nconst num = (x, d = NaN) => {\n  if (x === null || x === undefined || x === '') return d;\n  const n = Number(x);\n  return Number.isFinite(n) ? n : d;\n};\nconst r2 = (x) => (Number.isFinite(x) ? Math.round(x * 100) / 100 : null);\nconst r6 = (x) => (Number.isFinite(x) ? Math.round(x * 1e6) / 1e6 : null);\n\nfunction gate(proposals, ctx, redisMode) {\n  const g = ctx?.global ?? {};\n  const marks = ctx?.marks ?? {};\n  const decisions = [];\n  const escalations = [];\n\n  // Running per-account state: effective positions (incl. in-flight), gross,\n  // net and per-venue exposure, order count. Updated after every approval.\n  const state = {};\n  const acct = (id) => {\n    if (state[id] !== undefined) return state[id];\n    const a = ctx?.accounts?.[id];\n    if (!a) return (state[id] = null);\n    const pos = {};\n    for (const [k, v] of Object.entries(a.positions ?? {})) pos[k] = num(v?.qty, 0);\n    for (const [k, q] of Object.entries(a.pending ?? {})) pos[k] = (pos[k] ?? 0) + num(q, 0);\n    let gross = 0;\n    let net = 0;\n    const venue = {};\n    for (const [k, q] of Object.entries(pos)) {\n      const px = num(marks[k]?.px);\n      const notional = Number.isFinite(px) ? q * px : num(a.positions?.[k]?.notional_usd, 0);\n      const v = k.split('@')[1];\n      gross += Math.abs(notional);\n      net += notional;\n      venue[v] = (venue[v] ?? 0) + Math.abs(notional);\n    }\n    return (state[id] = { a, pos, gross, net, venue, orders: num(a.orders_last_min, 0) });\n  };\n\n  // Strategy capacity demand (exposure-increasing USD) -> pro-rata scale.\n  const pre = proposals.map((p) => {\n    const side = String(p?.side ?? '').toUpperCase();\n    const key = `${p?.symbol}@${p?.venue}`;\n    return { p, side, key };\n  });\n  const demand = {};\n  for (const { p, side, key } of pre) {\n    const st = p?.account_id ? acct(p.account_id) : null;\n    const px = num(marks[key]?.px);\n    const qty = num(p?.qty);\n    if (!st || !Number.isFinite(px) || !(qty > 0) || (side !== 'BUY' && side !== 'SELL')) continue;\n    const pos = st.pos[key] ?? 0;\n    const inc = (Math.abs(pos + sgn(side) * qty) - Math.abs(pos)) * px;\n    if (inc > 0) demand[p.strategy_id] = (demand[p.strategy_id] ?? 0) + inc;\n  }\n  const capScale = {};\n  for (const [sid, requested] of Object.entries(demand)) {\n    const s = ctx?.strategies?.[sid];\n    // A strategy missing from the approved limits document has no capacity.\n    const remaining = s ? Math.max(0, num(s.max_gross_usd, Infinity) - num(s.gross_usd, 0)) : 0;\n    capScale[sid] = requested > 0 ? Math.min(1, remaining / requested) : 1;\n  }\n\n  for (const { p, side, key } of pre) {\n    const checks = [];\n    const reasons = [];\n    const rec = (name, pass, value = null, limit = null) => {\n      checks.push({ name, pass, value, limit });\n      if (!pass) reasons.push(name);\n      return pass;\n    };\n    const base = {\n      proposal_id: p?.proposal_id,\n      cycle_id: p?.cycle_id ?? null,\n      account_id: p?.account_id,\n      strategy_id: p?.strategy_id,\n      symbol: p?.symbol,\n      venue: p?.venue,\n      side,\n      requested_qty: num(p?.qty, 0),\n      order_type: p?.order_type ?? 'LIMIT',\n      limit_px: p?.limit_px ?? null,\n      urgency: p?.urgency ?? 'normal',\n      pair_id: p?.pair_id ?? null,\n      limits_version: ctx?.limits_version ?? null,\n      state_version: ctx?.state_version ?? null,\n    };\n    const reject = (markPx = null) =>\n      decisions.push({ ...base, decision: 'REJECT', approved_qty: 0, reduce_only: false, mark_px: markPx, checks, reasons, escalate: null });\n\n    if (!rec('valid_proposal',\n      !!(p?.proposal_id && p?.account_id && p?.strategy_id && p?.symbol && p?.venue) &&\n      (side === 'BUY' || side === 'SELL') && num(p?.qty) > 0)) { reject(); continue; }\n    const st = acct(p.account_id);\n    if (!rec('account_known', !!st, p.account_id)) { reject(); continue; }\n\n    const a = st.a;\n    const mark = marks[key];\n    const px = num(mark?.px);\n    const pos = st.pos[key] ?? 0;\n    const s = sgn(side);\n    const sameDir = pos === 0 || Math.sign(pos) === s;\n    const reducing = !sameDir;\n    let q = num(p.qty);\n\n    // 1. Trading mode.\n    let mode = worst(redisMode, g.mode, ctx?.venues?.[p.venue]?.mode, ctx?.strategies?.[p.strategy_id]?.mode, a.mode);\n    if (a.key_status && a.key_status !== 'VERIFIED') mode = 'HALT';\n    if (a.billing_status && a.billing_status !== 'ACTIVE') mode = worst(mode, 'REDUCE_ONLY');\n\n    // 2. Loss limits escalate the whole account.\n    const dayPnl = num(a.day_pnl_pct, 0);\n    const dd = num(a.drawdown_pct, 0);\n    const dailyLimit = num(a.daily_loss_limit_pct);\n    const ddLimit = num(a.max_drawdown_pct);\n    if (Number.isFinite(dailyLimit) && dayPnl <= -dailyLimit) {\n      mode = worst(mode, 'REDUCE_ONLY');\n      escalations.push({ kind: 'mode', scope: 'account', scope_id: p.account_id, mode: 'REDUCE_ONLY',\n        reason: `daily_loss:${r6(dayPnl)}`, tier: 'T2', metric: 'day_pnl_pct', value: r6(dayPnl), limit: -dailyLimit });\n    }\n    if (Number.isFinite(ddLimit) && dd >= ddLimit) {\n      mode = 'HALT';\n      escalations.push({ kind: 'mode', scope: 'account', scope_id: p.account_id, mode: 'HALT',\n        reason: `max_drawdown:${r6(dd)}`, tier: 'T3', metric: 'drawdown_pct', value: r6(dd), limit: ddLimit });\n      escalations.push({ kind: 'kill', scope: 'account', scope_id: p.account_id,\n        action: a.auto_flatten_on_max_dd === true ? 'flatten' : 'cancel_all', reason: `max_drawdown:${r6(dd)}` });\n    }\n    if (!rec('trading_mode', mode !== 'HALT', mode)) { reject(); continue; }\n    if (mode === 'REDUCE_ONLY' && !rec('reduce_only_mode', reducing, { mode, position: r6(pos) })) { reject(); continue; }\n\n    // 3. Client mandate and restricted list (exits are always allowed).\n    if (Array.isArray(a.allowed_symbols) && !rec('mandate_symbol', a.allowed_symbols.includes(p.symbol), p.symbol)) { reject(); continue; }\n    if (Array.isArray(a.allowed_strategies) && !rec('mandate_strategy', a.allowed_strategies.includes(p.strategy_id), p.strategy_id)) { reject(); continue; }\n    const restricted = Array.isArray(g.restricted_symbols) && g.restricted_symbols.includes(p.symbol);\n    if (restricted && !rec('restricted_symbol_exit_only', reducing, p.symbol)) { reject(); continue; }\n\n    // 4. Fresh market data.\n    if (!rec('mark_available', Number.isFinite(px) && px > 0, key)) { reject(); continue; }\n    const maxAge = num(g.max_mark_age_s, 10);\n    if (!rec('mark_fresh', num(mark?.age_s, Infinity) <= maxAge, num(mark?.age_s, null), maxAge)) { reject(px); continue; }\n\n    // 5. Fat-finger collar.\n    if (p.limit_px !== null && p.limit_px !== undefined) {\n      const collar = num(g.price_collar_bps, 150);\n      const devBps = (Math.abs(num(p.limit_px) - px) / px) * 1e4;\n      if (!rec('price_collar', Number.isFinite(devBps) && devBps <= collar, r2(devBps), collar)) { reject(px); continue; }\n    }\n\n    // 6. Order-rate throttle (counts orders approved earlier in this batch).\n    const maxRate = num(g.max_orders_per_min_per_account, Infinity);\n    if (!rec('order_rate', st.orders + 1 <= maxRate, st.orders + 1, maxRate)) { reject(px); continue; }\n\n    const equity = num(a.equity_usd, 0);\n    if (!rec('equity_positive', equity > 0, equity)) { reject(px); continue; }\n\n    // 7. Sizing caps: each can only shrink q.\n    const shrink = (name, maxQ, value, limit) => {\n      const cap = Math.max(0, maxQ);\n      const ok = q <= cap + EPS;\n      checks.push({ name, pass: ok, value, limit });\n      if (!ok) { reasons.push(name); q = cap; }\n    };\n    const maxOrderUsd = Math.min(num(g.max_order_notional_usd, Infinity), num(a.max_order_notional_usd, Infinity));\n    shrink('max_order_notional', maxOrderUsd / px, r2(q * px), maxOrderUsd);\n    if (mode === 'REDUCE_ONLY' || restricted) shrink('exit_only_cap', Math.abs(pos), r6(q), r6(Math.abs(pos)));\n\n    if (Math.abs(pos + s * q) > Math.abs(pos) + EPS) {\n      // Position size as a share of equity.\n      const maxPosUsd = num(a.max_position_pct_equity, Infinity) * equity;\n      shrink('max_position', sameDir ? maxPosUsd / px - Math.abs(pos) : Math.abs(pos) + maxPosUsd / px,\n        r2(Math.abs(pos + s * q) * px), r2(maxPosUsd));\n      // Gross leverage: headroom in USD -> max quantity.\n      const growQ = (headroomUsd) => (sameDir ? headroomUsd / px : 2 * Math.abs(pos) + headroomUsd / px);\n      const maxGross = num(a.max_gross_leverage, Infinity) * equity;\n      shrink('max_gross_leverage', growQ(Math.max(0, maxGross - st.gross)),\n        r6((st.gross + (Math.abs(pos + s * q) - Math.abs(pos)) * px) / equity), num(a.max_gross_leverage, null));\n      // Counterparty concentration per venue.\n      const vCap = num(a.venue_caps_usd?.[p.venue]);\n      if (Number.isFinite(vCap)) {\n        const vExp = st.venue[p.venue] ?? 0;\n        shrink('venue_cap', growQ(Math.max(0, vCap - vExp)), r2(vExp), vCap);\n      }\n      // Strategy capacity, shared pro-rata across all accounts in the batch.\n      const scale = capScale[p.strategy_id] ?? 0;\n      if (scale < 1 - EPS) {\n        const keep = sameDir ? q * scale : Math.abs(pos) + Math.max(0, q - Math.abs(pos)) * scale;\n        shrink('strategy_capacity', keep, r6(scale), 1);\n      }\n    }\n    // Net leverage for single orders (pairs are hedged by construction).\n    if (!p.pair_id) {\n      const maxNet = num(a.max_net_leverage, Infinity) * equity;\n      if (s * st.net >= 0) shrink('max_net_leverage', (maxNet - Math.abs(st.net)) / px, r6((st.net + s * q * px) / equity), num(a.max_net_leverage, null));\n      else shrink('max_net_leverage', (Math.abs(st.net) + maxNet) / px, r6((st.net + s * q * px) / equity), num(a.max_net_leverage, null));\n    }\n\n    const minUsd = num(g.min_order_notional_usd, 0);\n    if (q > EPS && q * px < minUsd) { reasons.push('below_min_notional'); checks.push({ name: 'min_notional', pass: false, value: r2(q * px), limit: minUsd }); q = 0; }\n\n    const requested = num(p.qty);\n    const decision = q >= requested - EPS ? 'APPROVE' : q > EPS ? 'RESIZE' : 'REJECT';\n    const approved = decision === 'APPROVE' ? requested : decision === 'RESIZE' ? r6(q) : 0;\n    decisions.push({ ...base, decision, approved_qty: approved, mark_px: px,\n      reduce_only: reducing && approved <= Math.abs(pos) + EPS, checks, reasons, escalate: null });\n\n    // Update running state with what was approved.\n    if (approved > 0) {\n      const newPos = pos + s * approved;\n      st.gross += (Math.abs(newPos) - Math.abs(pos)) * px;\n      st.net += s * approved * px;\n      st.venue[p.venue] = (st.venue[p.venue] ?? 0) + (Math.abs(newPos) - Math.abs(pos)) * px;\n      st.pos[key] = newPos;\n      st.orders += 1;\n    }\n  }\n\n  // Hedged pairs: all legs or none, and keep the hedge ratio.\n  const pairs = {};\n  decisions.forEach((d, i) => { if (d.pair_id) (pairs[d.pair_id] ??= []).push(i); });\n  for (const idxs of Object.values(pairs)) {\n    const legs = idxs.map((i) => decisions[i]);\n    if (legs.length < 2 || legs.some((l) => l.decision === 'REJECT')) {\n      const why = legs.length < 2 ? 'pair_incomplete' : 'pair_leg_rejected';\n      for (const i of idxs) {\n        if (decisions[i].decision !== 'REJECT') decisions[i] = { ...decisions[i], decision: 'REJECT', approved_qty: 0, reduce_only: false, reasons: [...decisions[i].reasons, why] };\n      }\n      continue;\n    }\n    const ratio = Math.min(...legs.map((l) => l.approved_qty / l.requested_qty));\n    for (const i of idxs) {\n      const d = decisions[i];\n      if (ratio >= 1 - EPS) continue;\n      decisions[i] = { ...d, decision: 'RESIZE', approved_qty: r6(d.requested_qty * ratio),\n        reasons: d.reasons.includes('pair_hedge_ratio') ? d.reasons : [...d.reasons, 'pair_hedge_ratio'] };\n    }\n  }\n\n  const count = (k) => decisions.filter((d) => d.decision === k).length;\n  return {\n    decisions,\n    escalations,\n    stats: { proposals: proposals.length, approve: count('APPROVE'), resize: count('RESIZE'), reject: count('REJECT'),\n      limits_version: ctx?.limits_version ?? null, redis_mode: normMode(redisMode) },\n  };\n}\n\n// ---- n8n glue -------------------------------------------------------------\nconst proposals = $('Proposals in').all().map((i) => i.json);\nconst ctx = $('Load risk context').first().json.ctx;\nconst redisMode = $('Global mode (fast flag)').first().json.redis_mode ?? 'NORMAL';\nreturn [{ json: gate(proposals, ctx, redisMode) }];\n"
+      }
+    },
+    {
+      "id": "ace61fe8-3bfa-4473-8e6c-b08063322a9d",
+      "name": "Record decisions",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1400,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM risk.record_decisions($1::jsonb)",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ decisions: $json.decisions }) }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "aqosCredPgMain00",
+          "name": "AQOS Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "d24d18f7-7e2a-4282-8d44-df0b47470d76",
+      "name": "Approved or resized?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1680,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "254f8102-ddd6-4d6f-8d56-25c1899b0c2f",
+              "leftValue": "={{ $json.decision }}",
+              "rightValue": "REJECT",
+              "operator": {
+                "type": "string",
+                "operation": "notEquals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "f6005e06-9769-44a0-8e3f-b982d9dd8332",
+      "name": "Dispatch orders",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.4,
+      "position": [
+        1960,
+        0
+      ],
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "AQOS05ExecDisptc",
+          "mode": "id"
+        },
+        "mode": "once",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    },
+    {
+      "id": "a984fe43-e748-477c-8bae-a563ac097ab5",
+      "name": "Collect escalations",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1400,
+        150
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Deduplicates escalations raised during the gate pass. Mode changes are\n// applied in SQL (ratchet); kills go to the Kill Switch workflow. Kill\n// request ids are bucketed per minute so repeats inside a minute collapse.\nconst out = $('Pre-trade checks').first().json;\nconst unique = new Map();\nfor (const e of out.escalations ?? []) {\n  const k = `${e.kind}|${e.scope}|${e.scope_id}|${e.mode ?? e.action}`;\n  if (!unique.has(k)) unique.set(k, e);\n}\nconst esc = [...unique.values()];\nconst minute = Math.floor(Date.now() / 60_000);\nconst actions = esc.filter((e) => e.kind === 'mode').map((e) => ({\n  scope: e.scope, scope_id: e.scope_id, mode: e.mode, reason: e.reason, tier: e.tier,\n  metric: e.metric, value: e.value, limit: e.limit, fingerprint: `gate:${e.scope}:${e.scope_id}:${e.mode}`,\n}));\nconst kills = esc.filter((e) => e.kind === 'kill').map((e) => ({\n  request_id: `gate:${e.scope}:${e.scope_id}:${e.action}:${minute}`,\n  scope: e.scope, scope_id: e.scope_id, action: e.action, reason: e.reason, requested_by: 'risk_gate',\n}));\nif (!actions.length && !kills.length) return [];\nreturn [{ json: { snapshot_source: null, fingerprint: `gate:${minute}`, actions, kills } }];\n"
+      }
+    },
+    {
+      "id": "df5f4cd6-833e-414a-8072-8c9ef05ccdaa",
+      "name": "Apply mode escalations",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1680,
+        150
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT risk.apply_actions($1::jsonb) AS r",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify($json) }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "aqosCredPgMain00",
+          "name": "AQOS Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "8e90d202-c082-4573-8e1b-a56c3e4b73a6",
+      "name": "Fan out kills",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1960,
+        150
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// One item per kill request for the Kill Switch sub-workflow.\nconst src = $('Collect escalations').first().json;\nconst kills = src.kills ?? [];\nreturn kills.map((k) => ({ json: k }));\n"
+      }
+    },
+    {
+      "id": "bd14d784-c49f-4d6d-81e5-08564c05e71b",
+      "name": "Kill switch",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.4,
+      "position": [
+        2240,
+        0
+      ],
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "AQOS14KillSwitch",
+          "mode": "id"
+        },
+        "mode": "once",
+        "options": {
+          "waitForSubWorkflow": false
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Proposals in": {
+      "main": [
+        [
+          {
+            "node": "Gate scope",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gate scope": {
+      "main": [
+        [
+          {
+            "node": "Load risk context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load risk context": {
+      "main": [
+        [
+          {
+            "node": "Global mode (fast flag)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Global mode (fast flag)": {
+      "main": [
+        [
+          {
+            "node": "Pre-trade checks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pre-trade checks": {
+      "main": [
+        [
+          {
+            "node": "Record decisions",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Collect escalations",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record decisions": {
+      "main": [
+        [
+          {
+            "node": "Approved or resized?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approved or resized?": {
+      "main": [
+        [
+          {
+            "node": "Dispatch orders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect escalations": {
+      "main": [
+        [
+          {
+            "node": "Apply mode escalations",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply mode escalations": {
+      "main": [
+        [
+          {
+            "node": "Fan out kills",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fan out kills": {
+      "main": [
+        [
+          {
+            "node": "Kill switch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "UTC",
+    "saveDataErrorExecution": "all",
+    "saveManualExecutions": false,
+    "errorWorkflow": "AQOS13ErrorHandl",
+    "executionTimeout": 120
+  },
+  "pinData": {},
+  "tags": [
+    {
+      "name": "aqos"
+    }
+  ],
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}

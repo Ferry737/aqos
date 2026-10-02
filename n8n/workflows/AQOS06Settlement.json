@@ -1,0 +1,417 @@
+{
+  "id": "AQOS06Settlement",
+  "name": "AQOS-06 Settlement and reconciliation",
+  "active": true,
+  "nodes": [
+    {
+      "id": "1530ea75-10fb-4842-8d50-41796baf633b",
+      "name": "Execution events (from gateway)",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "inputSource": "passthrough"
+      }
+    },
+    {
+      "id": "785ce7b6-ebe7-4cc2-80a1-f948c153d1dc",
+      "name": "Apply execution events",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        280,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT oms.apply_execution_events($1::jsonb) AS r",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ events: $json.r.payload.events, slippage_alert_bps: 25 }) }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "aqosCredPgMain00",
+          "name": "AQOS Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "6ee7fb25-d6cd-44a3-8166-ac9f5bc56b2b",
+      "name": "Notable events",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        560,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Alerting on execution events: liquidations and ADL page (SEV1), venue\n// rejects notify (SEV2), slippage outliers are logged to the ops channel (SEV3).\nconst r = $input.first().json.r ?? {};\nconst notable = Array.isArray(r.notable) ? r.notable : [];\nif (!notable.length) return [];\nconst severity = notable.some((n) => n.severity === 'SEV1') ? 'SEV1' : notable.some((n) => n.severity === 'SEV2') ? 'SEV2' : 'SEV3';\nconst lines = notable.slice(0, 20).map((n) => [\n  n.severity, n.kind, n.account_id, n.symbol, n.venue,\n  n.slippage_bps != null ? `${n.slippage_bps} bps` : null, n.reason,\n].filter(Boolean).join(' '));\nreturn [{\n  json: {\n    severity,\n    count: notable.length,\n    text: `[${severity}] Execution events: ${notable.length} notable\\n${lines.join('\\n')}`,\n    dedup_key: `exec-${severity}-${new Date().toISOString().slice(0, 13)}`,\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "e1678eb0-9e76-4784-8843-6a7bb1801952",
+      "name": "Reconcile every 5 min",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        0,
+        150
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "30 */5 * * * *"
+            }
+          ]
+        },
+        "misfirePolicy": "skip",
+        "misfireGraceSeconds": 0
+      }
+    },
+    {
+      "id": "6bc4f1f3-7298-478b-81b9-631ec187027a",
+      "name": "Fetch venue snapshots",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        280,
+        150
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://ems:8080/v1/snapshots",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ { accounts: \"all\" } }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "aqosCredEmsAuth00",
+          "name": "AQOS EMS Token"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput",
+      "notes": "EMS returns { accounts: [{ account_id, venue, positions: [{symbol, qty}], external_orders_count, external_fills_count }] } straight from each venue.",
+      "notesInFlow": false
+    },
+    {
+      "id": "d1347495-4228-4615-8d4e-b1e98104d123",
+      "name": "Reconcile",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        560,
+        150
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM oms.reconcile($1::jsonb)",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ accounts: $json.accounts, tolerance_usd: 5 }) }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "aqosCredPgMain00",
+          "name": "AQOS Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "4dfb8bd2-49a1-4118-8e25-cacdb4764390",
+      "name": "Break policy",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        840,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Reconciliation outcome -> actions. Venue truth was already adopted in SQL.\n// A HIGH unexplained break moves that account to REDUCE_ONLY until a human\n// reviews it. Client-initiated activity (manual trades in their own account)\n// is reported, never penalised: it is their account.\nconst breaks = $input.all().map((i) => i.json).filter((b) => b && b.break_id);\nif (!breaks.length) return [];\nconst byAccount = {};\nfor (const b of breaks) (byAccount[b.account_id] ??= []).push(b);\nconst actions = [];\nfor (const [account, bs] of Object.entries(byAccount)) {\n  const severe = bs.filter((b) => b.classification === 'unknown' && b.severity === 'HIGH');\n  if (severe.length) {\n    actions.push({\n      scope: 'account', scope_id: account, mode: 'REDUCE_ONLY', reason: 'recon:unexplained_break', tier: 'T2',\n      metric: 'recon_diff_usd', value: Math.max(...severe.map((b) => Number(b.diff_usd))), limit: 1000,\n      fingerprint: `recon:${account}:${severe.map((b) => b.break_id).join(',')}`,\n    });\n  }\n}\nconst external = [...new Set(breaks.filter((b) => b.classification === 'external_activity').map((b) => b.account_id))];\nconst text = `[RECON] ${breaks.length} break(s), ${actions.length} account(s) set REDUCE_ONLY\\n`\n  + breaks.slice(0, 15).map((b) => `${b.account_id} ${b.venue} ${b.symbol}: ${b.classification}/${b.severity} diff ${b.diff_qty} ($${b.diff_usd})`).join('\\n');\nreturn [{ json: { severity: actions.length ? 'SEV2' : 'SEV3', snapshot_source: null, fingerprint: `recon:${breaks.map((b) => b.break_id).join(',')}`, actions, external_accounts: external, text, severe: actions.length > 0 } }];\n"
+      }
+    },
+    {
+      "id": "4abf94ba-ece2-4ae1-89d5-48589d0411ca",
+      "name": "Apply recon actions",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1120,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT risk.apply_actions($1::jsonb) AS r",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify($json) }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "aqosCredPgMain00",
+          "name": "AQOS Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "47c1e14d-699c-4d35-8007-a99ec944fa7b",
+      "name": "Day close 00:00:30 UTC",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "30 0 0 * * *"
+            }
+          ]
+        },
+        "misfirePolicy": "coalesce_owner",
+        "misfireGraceSeconds": 3600
+      }
+    },
+    {
+      "id": "ceed0f84-de53-4365-8644-e511f3f330b7",
+      "name": "Close day",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        280,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT pnl.close_day($1::jsonb) AS r",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({}) }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "aqosCredPgMain00",
+          "name": "AQOS Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "20f31a1d-fa81-4192-8e08-fe10001a6506",
+      "name": "Day close notice",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.5,
+      "position": [
+        560,
+        300
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "",
+              "name": "severity",
+              "value": "INFO",
+              "type": "string"
+            },
+            {
+              "id": "",
+              "name": "text",
+              "value": "={{ \"[DAY CLOSE] \" + $json.r.day + \": \" + $json.r.accounts_closed + \" accounts snapshotted, \" + $json.r.daily_loss_holds_lifted + \" daily-loss hold(s) lifted\" }}",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": false,
+        "options": {}
+      }
+    },
+    {
+      "id": "29335b7d-d16e-4669-8cbf-4cc2c0b30c57",
+      "name": "Notify",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.4,
+      "position": [
+        1120,
+        150
+      ],
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "AQOS16Notifier00",
+          "mode": "id"
+        },
+        "mode": "once",
+        "options": {
+          "waitForSubWorkflow": false
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Execution events (from gateway)": {
+      "main": [
+        [
+          {
+            "node": "Apply execution events",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply execution events": {
+      "main": [
+        [
+          {
+            "node": "Notable events",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notable events": {
+      "main": [
+        [
+          {
+            "node": "Notify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reconcile every 5 min": {
+      "main": [
+        [
+          {
+            "node": "Fetch venue snapshots",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch venue snapshots": {
+      "main": [
+        [
+          {
+            "node": "Reconcile",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reconcile": {
+      "main": [
+        [
+          {
+            "node": "Break policy",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Break policy": {
+      "main": [
+        [
+          {
+            "node": "Apply recon actions",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Notify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Day close 00:00:30 UTC": {
+      "main": [
+        [
+          {
+            "node": "Close day",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Close day": {
+      "main": [
+        [
+          {
+            "node": "Day close notice",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Day close notice": {
+      "main": [
+        [
+          {
+            "node": "Notify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "UTC",
+    "saveDataErrorExecution": "all",
+    "saveManualExecutions": false,
+    "errorWorkflow": "AQOS13ErrorHandl",
+    "executionTimeout": 240
+  },
+  "pinData": {},
+  "tags": [
+    {
+      "name": "aqos"
+    }
+  ],
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}

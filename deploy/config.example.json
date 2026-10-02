@@ -1,0 +1,9 @@
+{
+  "SLACK_OPS_CHANNEL": "aqos-ops",
+  "PAGERDUTY_SERVICE_ID": "REPLACE_PAGERDUTY_SERVICE_ID",
+  "PAGERDUTY_FROM_EMAIL": "oncall@your-domain.example",
+  "MAIL_FROM": "AQOS <no-reply@your-domain.example>",
+  "SCREENING_URL": "https://your-kyc-provider.example/v1/check",
+  "DEADMAN_URL": "https://your-deadman-switch.example/ping/REPLACE",
+  "DASHBOARD_URL": "https://app.your-domain.example"
+}

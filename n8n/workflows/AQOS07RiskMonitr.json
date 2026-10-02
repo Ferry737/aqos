@@ -1,0 +1,686 @@
+{
+  "id": "AQOS07RiskMonitr",
+  "name": "AQOS-07 Risk monitor",
+  "active": true,
+  "nodes": [
+    {
+      "id": "8fb4d135-3cdb-4e23-8313-ce1dfa4fd935",
+      "name": "Every 15 s",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "seconds",
+              "secondsInterval": 15
+            }
+          ]
+        },
+        "misfirePolicy": "skip",
+        "misfireGraceSeconds": 0
+      }
+    },
+    {
+      "id": "51b16bad-de28-4b16-8679-f15cb4ec2ebb",
+      "name": "Market stress event",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        150
+      ],
+      "parameters": {
+        "inputSource": "passthrough"
+      }
+    },
+    {
+      "id": "92d0af96-7bd9-488c-806c-d9ed85d4c13b",
+      "name": "Risk service snapshot",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        280,
+        0
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "http://risk-svc:8080/v1/snapshot",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 4000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "aqosCredRiskSvc00",
+          "name": "AQOS Risk Service Token"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 1,
+      "waitBetweenTries": 500,
+      "onError": "continueErrorOutput",
+      "notes": "Custom risk service: 99% 1-day VaR, 97.5% ES, correlation absorption, liquidation distance in sigmas, stablecoin peg, venue health.",
+      "notesInFlow": false
+    },
+    {
+      "id": "f2a3d1d7-aa9f-48dc-8b8e-7c1decf92f97",
+      "name": "DB fallback snapshot",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        560,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT risk.snapshot_basic($1::jsonb) AS s",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({}) }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "aqosCredPgMain00",
+          "name": "AQOS Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "81b59334-eef6-41f8-87a2-92023d230a7b",
+      "name": "Normalize snapshot",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        840,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Accepts either the risk-service snapshot (JSON body) or the degraded DB\n// fallback ({ s: ... }). The fallback has no VaR/ES; the breaker policy\n// treats a long fallback streak as \"risk not measurable\".\nconst j = $input.first().json;\nconst snap = j.s ?? j;\nconst source = j.s ? 'db_fallback' : snap.source ?? 'risk_svc';\nlet trigger = 'schedule';\ntry { if ($('Market stress event').isExecuted) trigger = 'event'; } catch { /* trigger not in this run */ }\nreturn [{ json: { snapshot: { ...snap, source }, trigger } }];\n"
+      }
+    },
+    {
+      "id": "d2b68044-57b5-4053-8b6c-9da57706b52e",
+      "name": "Breaker context",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1120,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT risk.breaker_context($1::jsonb) AS c",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({}) }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "aqosCredPgMain00",
+          "name": "AQOS Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "31d2c363-9bdc-4cb3-8fa0-208a1895f1ad",
+      "name": "Evaluate breakers",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1400,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ===========================================================================\n// AQOS · WF-07 Risk Monitor · Circuit-breaker policy (deterministic)\n//   T1 WARN        : notify (VaR > 80% of limit, correlation concentration)\n//   T2 REDUCE_ONLY : no new risk (VaR >= limit, daily loss, depeg, venue\n//                    withdrawals suspended, liquidation distance <= 3 sigma,\n//                    risk unmeasurable for N passes, stale marks)\n//   T3 HALT        : cancel open orders, block new (ES >= 125% of limit,\n//                    max drawdown, severe depeg, venue down)\n//   T4 FLATTEN     : controlled exit beats a forced liquidation\n//                    (liquidation distance <= 1.5 sigma, or client opted in)\n// Escalation is automatic. Lifting HALT needs two humans (WF-14 reset).\n// Actions that would not change state are dropped; kill requests already\n// issued in the last 30 minutes (by fingerprint) are not re-sent.\n// ===========================================================================\nconst RANK = { NORMAL: 0, REDUCE_ONLY: 1, HALT: 2 };\nconst num = (x) => (x === null || x === undefined || x === '' ? NaN : Number(x));\nconst r4 = (x) => Math.round(x * 1e4) / 1e4;\n\nfunction evaluate(snap, c) {\n  const P = c?.policy ?? {};\n  const g = snap?.global ?? {};\n  const src = snap?.source ?? 'risk_svc';\n  const modeActs = [];\n  const kills = [];\n  const warnings = [];\n  const mode = (scope, scope_id, m, reason, tier, metric, value, limit) =>\n    modeActs.push({ scope, scope_id, mode: m, reason, tier, metric, value, limit, fingerprint: `mode:${scope}:${scope_id}:${m}` });\n  const kill = (scope, scope_id, action, reason) =>\n    kills.push({ scope, scope_id, action, reason, tier: action === 'flatten' ? 'T4' : 'T3', fingerprint: `kill:${scope}:${scope_id}:${action}` });\n\n  // Measurement health.\n  const streak = num(c?.monitor?.fallback_streak) || 0;\n  if (src === 'db_fallback' && streak + 1 >= num(P.fallback_streak_reduce ?? 8)) {\n    mode('global', '*', 'REDUCE_ONLY', 'risk_unmeasurable:fallback_streak', 'T2', 'fallback_streak', streak + 1, num(P.fallback_streak_reduce ?? 8));\n  }\n  const markAge = num(g.max_mark_age_s);\n  if (Number.isFinite(markAge) && markAge > num(P.max_mark_age_s_halt ?? 60)) {\n    mode('global', '*', 'REDUCE_ONLY', `stale_marks:${markAge}s`, 'T2', 'max_mark_age_s', markAge, num(P.max_mark_age_s_halt ?? 60));\n  }\n\n  // Portfolio VaR / ES (risk service only).\n  if (num(g.var_limit_usd) > 0) {\n    const u = num(g.var_99_1d_usd) / num(g.var_limit_usd);\n    if (u >= num(P.var_util_reduce ?? 1)) mode('global', '*', 'REDUCE_ONLY', `var_util:${r4(u)}`, 'T2', 'var_util', r4(u), num(P.var_util_reduce ?? 1));\n    else if (u >= num(P.var_util_warn ?? 0.8)) warnings.push({ code: 'var_util_high', value: r4(u) });\n  }\n  if (num(g.es_limit_usd) > 0) {\n    const u = num(g.es_975_1d_usd) / num(g.es_limit_usd);\n    if (u >= num(P.es_util_halt ?? 1.25)) {\n      mode('global', '*', 'HALT', `es_util:${r4(u)}`, 'T3', 'es_util', r4(u), num(P.es_util_halt ?? 1.25));\n      kill('global', '*', 'cancel_all', `es_util:${r4(u)}`);\n    }\n  }\n  if (num(g.absorption_ratio) >= num(P.absorption_warn ?? 0.85)) warnings.push({ code: 'correlation_concentration', value: num(g.absorption_ratio) });\n\n  // Stablecoin depegs (collateral and quote-currency risk).\n  for (const [coin, bps] of Object.entries(g.stablecoin_depeg_bps ?? {})) {\n    const b = Math.abs(num(bps));\n    if (b >= num(P.depeg_bps_halt ?? 200)) {\n      mode('global', '*', 'HALT', `depeg:${coin}:${b}bps`, 'T3', 'depeg_bps', b, num(P.depeg_bps_halt ?? 200));\n      kill('global', '*', 'cancel_all', `depeg:${coin}`);\n    } else if (b >= num(P.depeg_bps_reduce ?? 50)) {\n      mode('global', '*', 'REDUCE_ONLY', `depeg:${coin}:${b}bps`, 'T2', 'depeg_bps', b, num(P.depeg_bps_reduce ?? 50));\n    }\n  }\n\n  // Venue / counterparty health.\n  for (const v of snap?.venues ?? []) {\n    if (v.health === 'DOWN') mode('venue', v.venue, 'HALT', 'venue_down', 'T3', null, null, null);\n    else if (v.withdrawals_suspended === true) mode('venue', v.venue, 'REDUCE_ONLY', 'counterparty:withdrawals_suspended', 'T2', null, null, null);\n  }\n\n  // Accounts.\n  for (const a of snap?.accounts ?? []) {\n    const dd = num(a.drawdown_pct);\n    const day = num(a.day_pnl_pct);\n    const ddLim = num(a.max_drawdown_pct);\n    const dayLim = num(a.daily_loss_limit_pct);\n    if (Number.isFinite(dd) && Number.isFinite(ddLim) && dd >= ddLim) {\n      mode('account', a.account_id, 'HALT', `max_drawdown:${r4(dd)}`, 'T3', 'drawdown_pct', r4(dd), ddLim);\n      kill('account', a.account_id, a.auto_flatten_on_max_dd === true ? 'flatten' : 'cancel_all', 'max_drawdown');\n    } else if (Number.isFinite(day) && Number.isFinite(dayLim) && day <= -dayLim) {\n      mode('account', a.account_id, 'REDUCE_ONLY', `daily_loss:${r4(day)}`, 'T2', 'day_pnl_pct', r4(day), -dayLim);\n    }\n    const liq = num(a.min_liq_distance_sigma);\n    if (Number.isFinite(liq)) {\n      if (liq <= num(P.liq_distance_sigma_flatten ?? 1.5)) {\n        mode('account', a.account_id, 'HALT', `liq_distance:${liq}sigma`, 'T4', 'liq_distance_sigma', liq, num(P.liq_distance_sigma_flatten ?? 1.5));\n        kill('account', a.account_id, 'flatten', `liquidation_distance_${liq}_sigma`);\n      } else if (liq <= num(P.liq_distance_sigma_reduce ?? 3)) {\n        mode('account', a.account_id, 'REDUCE_ONLY', `liq_distance:${liq}sigma`, 'T2', 'liq_distance_sigma', liq, num(P.liq_distance_sigma_reduce ?? 3));\n      }\n    }\n  }\n\n  // Keep only what changes state.\n  const current = {};\n  for (const m of c?.modes ?? []) current[`${m.scope}:${m.scope_id}`] = String(m.mode).toUpperCase();\n  const best = {};\n  for (const a of modeActs) {\n    const k = `${a.scope}:${a.scope_id}`;\n    if (!best[k] || RANK[a.mode] > RANK[best[k].mode]) best[k] = a;\n  }\n  const effectiveModes = Object.values(best).filter((a) => (RANK[current[`${a.scope}:${a.scope_id}`] ?? 'NORMAL'] ?? 2) < RANK[a.mode]);\n  const recent = new Set(c?.recent_fingerprints ?? []);\n  const uniqKills = [...new Map(kills.map((k) => [k.fingerprint, k])).values()];\n  const newKills = uniqKills.filter((k) => !recent.has(k.fingerprint));\n\n  const severity = effectiveModes.length || newKills.length ? 'ACT' : warnings.length ? 'WARN' : 'OK';\n  const fingerprint = [...effectiveModes.map((a) => a.fingerprint), ...newKills.map((k) => k.fingerprint), ...warnings.map((w) => w.code)].sort().join('|') || 'ok';\n  const lines = [\n    ...effectiveModes.map((a) => `${a.tier} ${a.scope}:${a.scope_id} -> ${a.mode} (${a.reason})`),\n    ...newKills.map((k) => `${k.tier} ${k.scope}:${k.scope_id} -> ${k.action.toUpperCase()} (${k.reason})`),\n    ...warnings.map((w) => `T1 ${w.code} = ${w.value}`),\n  ];\n  return {\n    severity,\n    snapshot_source: src,\n    actions: [...effectiveModes, ...newKills],\n    kills: newKills.map((k) => ({ ...k, request_id: `${k.fingerprint}:${Math.floor(Date.now() / 60_000)}`, requested_by: 'risk_monitor' })),\n    warnings,\n    fingerprint,\n    text: `[RISK ${severity}] source=${src}\\n${lines.join('\\n')}`,\n  };\n}\n\n// ---- n8n glue -------------------------------------------------------------\nconst snap = $('Normalize snapshot').first().json.snapshot;\nconst c = $input.first().json.c;\nreturn [{ json: evaluate(snap, c) }];\n"
+      }
+    },
+    {
+      "id": "b3cf0341-fb5d-4376-8a82-c63db048319b",
+      "name": "Apply mode changes",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1680,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT risk.apply_actions($1::jsonb) AS r",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify($json) }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "aqosCredPgMain00",
+          "name": "AQOS Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "282100d0-ed2f-44cd-8bed-bdb48441c986",
+      "name": "Plan follow-ups",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1960,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// After the database applied the ratcheted mode changes: mirror the global\n// mode into the Redis fast flag (DB result is authoritative) and pass on\n// kill requests and the alert payload.\nconst evalOut = $('Evaluate breakers').first().json;\nconst r = $input.first().json.r ?? { changed: [] };\nconst globalChange = (r.changed ?? []).find((x) => x.scope === 'global');\nreturn [{\n  json: {\n    ...evalOut,\n    mirror_global_mode: globalChange ? globalChange.mode : null,\n    changed: r.changed ?? [],\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "6ae8895b-9092-47ae-810b-a7669e4d3084",
+      "name": "Global mode changed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        2240,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "f0294353-a4d4-4970-835f-fb4bfa07177a",
+              "leftValue": "={{ $json.mirror_global_mode }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "0d240159-794a-41d7-8a67-3280e4fb5dba",
+      "name": "Mirror global mode",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        2520,
+        0
+      ],
+      "parameters": {
+        "operation": "set",
+        "key": "aqos:mode:global",
+        "value": "={{ $json.mirror_global_mode }}",
+        "keyType": "string",
+        "expire": false
+      },
+      "credentials": {
+        "redis": {
+          "id": "aqosCredRedis0000",
+          "name": "AQOS Redis"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 500
+    },
+    {
+      "id": "a2a136cc-32ba-48bd-84b9-20b1e19b966c",
+      "name": "Kills needed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        2240,
+        150
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "5ab18e04-27b6-4f41-81bb-f5e2957c58ef",
+              "leftValue": "={{ $json.kills.length }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "8630e5e9-42db-4cd7-8aa3-ce8038038eea",
+      "name": "Fan out kills",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2520,
+        150
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// One item per kill request for the Kill Switch sub-workflow.\nconst src = $('Plan follow-ups').first().json;\nconst kills = src.kills ?? [];\nreturn kills.map((k) => ({ json: k }));\n"
+      }
+    },
+    {
+      "id": "a2d332b3-de0b-43d9-80d4-a2811200b90e",
+      "name": "Kill switch",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.4,
+      "position": [
+        2800,
+        0
+      ],
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "AQOS14KillSwitch",
+          "mode": "id"
+        },
+        "mode": "once",
+        "options": {
+          "waitForSubWorkflow": false
+        }
+      }
+    },
+    {
+      "id": "0ddc727b-253f-4467-8ac2-4d5e12274ad8",
+      "name": "Last alert fingerprint",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        2240,
+        300
+      ],
+      "parameters": {
+        "operation": "get",
+        "propertyName": "last_alert_fp",
+        "key": "aqos:risk:last_alert_fp",
+        "keyType": "string"
+      },
+      "credentials": {
+        "redis": {
+          "id": "aqosCredRedis0000",
+          "name": "AQOS Redis"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 500,
+      "executeOnce": true
+    },
+    {
+      "id": "2016d995-f6e7-42bb-872f-cf0e4f4123c7",
+      "name": "Dedupe alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2520,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Page once per distinct risk situation, not every 15 seconds.\nconst plan = $('Plan follow-ups').first().json;\nconst last = $input.first().json.last_alert_fp ?? null;\nif (plan.severity === 'OK' || plan.fingerprint === last) return [];\nreturn [{ json: { ...plan, dedup_key: `risk-${plan.fingerprint}`.slice(0, 250) } }];\n"
+      }
+    },
+    {
+      "id": "bf58e07a-9002-4e99-8afb-96ec573a50aa",
+      "name": "Save alert fingerprint",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        2800,
+        150
+      ],
+      "parameters": {
+        "operation": "set",
+        "key": "aqos:risk:last_alert_fp",
+        "value": "={{ $json.fingerprint }}",
+        "keyType": "string",
+        "expire": false
+      },
+      "credentials": {
+        "redis": {
+          "id": "aqosCredRedis0000",
+          "name": "AQOS Redis"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 500
+    },
+    {
+      "id": "9a32d894-a90e-4273-8bb6-e3721efdc86a",
+      "name": "Notify",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.4,
+      "position": [
+        3080,
+        0
+      ],
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "AQOS16Notifier00",
+          "mode": "id"
+        },
+        "mode": "once",
+        "options": {
+          "waitForSubWorkflow": false
+        }
+      }
+    },
+    {
+      "id": "57e01a49-e8b7-4e2e-8c17-2d0afd69ebd8",
+      "name": "Needs analyst?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        2800,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "f9c55ae8-fa01-48ce-80c8-e162d913fb85",
+              "leftValue": "={{ $json.severity }}",
+              "rightValue": "ACT",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "0301af30-28f6-4c1b-8ef3-49acb8a2e426",
+      "name": "Risk analyst",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.4,
+      "position": [
+        3080,
+        150
+      ],
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "AQOS15RiskAnalys",
+          "mode": "id"
+        },
+        "mode": "once",
+        "options": {
+          "waitForSubWorkflow": false
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Every 15 s": {
+      "main": [
+        [
+          {
+            "node": "Risk service snapshot",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Market stress event": {
+      "main": [
+        [
+          {
+            "node": "Risk service snapshot",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Risk service snapshot": {
+      "main": [
+        [
+          {
+            "node": "Normalize snapshot",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "DB fallback snapshot",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "DB fallback snapshot": {
+      "main": [
+        [
+          {
+            "node": "Normalize snapshot",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize snapshot": {
+      "main": [
+        [
+          {
+            "node": "Breaker context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Breaker context": {
+      "main": [
+        [
+          {
+            "node": "Evaluate breakers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluate breakers": {
+      "main": [
+        [
+          {
+            "node": "Apply mode changes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply mode changes": {
+      "main": [
+        [
+          {
+            "node": "Plan follow-ups",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Plan follow-ups": {
+      "main": [
+        [
+          {
+            "node": "Global mode changed?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Kills needed?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Last alert fingerprint",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Global mode changed?": {
+      "main": [
+        [
+          {
+            "node": "Mirror global mode",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Kills needed?": {
+      "main": [
+        [
+          {
+            "node": "Fan out kills",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fan out kills": {
+      "main": [
+        [
+          {
+            "node": "Kill switch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Last alert fingerprint": {
+      "main": [
+        [
+          {
+            "node": "Dedupe alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dedupe alert": {
+      "main": [
+        [
+          {
+            "node": "Save alert fingerprint",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Needs analyst?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save alert fingerprint": {
+      "main": [
+        [
+          {
+            "node": "Notify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs analyst?": {
+      "main": [
+        [
+          {
+            "node": "Risk analyst",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "UTC",
+    "saveDataErrorExecution": "all",
+    "saveManualExecutions": false,
+    "errorWorkflow": "AQOS13ErrorHandl",
+    "executionTimeout": 60,
+    "saveDataSuccessExecution": "none"
+  },
+  "pinData": {},
+  "tags": [
+    {
+      "name": "aqos"
+    }
+  ],
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}

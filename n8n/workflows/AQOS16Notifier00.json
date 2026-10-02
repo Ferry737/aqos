@@ -1,0 +1,189 @@
+{
+  "id": "AQOS16Notifier00",
+  "name": "AQOS-16 Notifier",
+  "active": false,
+  "nodes": [
+    {
+      "id": "cfa8f200-0076-4ea2-8689-68342f0c99e8",
+      "name": "Alert in",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "inputSource": "passthrough"
+      }
+    },
+    {
+      "id": "c24e779a-e529-4213-8429-e4302054b47b",
+      "name": "Route alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        280,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// The one place ops alerts are routed. SEV1 pages on-call (PagerDuty) and\n// posts to the ops chat; everything else posts to the ops chat only.\n// ACT/WARN from the risk monitor map to SEV1/SEV2.\nconst MAP = { ACT: 'SEV1', WARN: 'SEV2', OK: 'INFO' };\nreturn $input.all().map(({ json: j }) => {\n  const raw = String(j.severity ?? 'INFO').toUpperCase();\n  const severity = ['SEV1', 'SEV2', 'SEV3', 'INFO'].includes(raw) ? raw : MAP[raw] ?? 'INFO';\n  const text = String(j.text ?? JSON.stringify(j)).slice(0, 3900);\n  return {\n    json: {\n      severity,\n      text,\n      summary: text.split('\\n')[0].slice(0, 1000),\n      dedup_key: String(j.dedup_key ?? `${severity}:${text.split('\\n')[0]}`).slice(0, 255),\n    },\n  };\n});\n"
+      }
+    },
+    {
+      "id": "0432f442-0d88-4b45-828f-553e1cc580f9",
+      "name": "Post to ops chat",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.7,
+      "position": [
+        560,
+        0
+      ],
+      "parameters": {
+        "authentication": "accessToken",
+        "resource": "message",
+        "operation": "post",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "aqos-ops",
+          "mode": "name"
+        },
+        "messageType": "text",
+        "text": "={{ $json.text }}",
+        "otherOptions": {}
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "aqosCredSlack0000",
+          "name": "AQOS Slack"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "id": "642f2afe-2d2f-45c7-86c5-d9820ac072ae",
+      "name": "Is SEV1",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        560,
+        150
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "1cc0d363-62eb-476f-8254-672ee25391c4",
+              "leftValue": "={{ $json.severity }}",
+              "rightValue": "SEV1",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "6090f64e-3996-4a0c-8207-70a0953d02b6",
+      "name": "Page on-call",
+      "type": "n8n-nodes-base.pagerDuty",
+      "typeVersion": 1,
+      "position": [
+        840,
+        0
+      ],
+      "parameters": {
+        "authentication": "apiToken",
+        "resource": "incident",
+        "operation": "create",
+        "title": "={{ $json.summary }}",
+        "serviceId": "REPLACE_PAGERDUTY_SERVICE_ID",
+        "email": "oncall@example.com",
+        "additionalFields": {
+          "details": "={{ $json.text }}"
+        }
+      },
+      "credentials": {
+        "pagerDutyApi": {
+          "id": "aqosCredPagerDty0",
+          "name": "AQOS PagerDuty"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    }
+  ],
+  "connections": {
+    "Alert in": {
+      "main": [
+        [
+          {
+            "node": "Route alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route alert": {
+      "main": [
+        [
+          {
+            "node": "Post to ops chat",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Is SEV1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is SEV1": {
+      "main": [
+        [
+          {
+            "node": "Page on-call",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "UTC",
+    "saveDataErrorExecution": "all",
+    "saveManualExecutions": false,
+    "errorWorkflow": "AQOS13ErrorHandl",
+    "executionTimeout": 60,
+    "saveDataSuccessExecution": "none"
+  },
+  "pinData": {},
+  "tags": [
+    {
+      "name": "aqos"
+    }
+  ],
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}

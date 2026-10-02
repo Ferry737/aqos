@@ -1,0 +1,9 @@
+node_modules/
+# local secrets and per-deployment config
+deploy/.env
+deploy/config.json
+*.log
+# agent run workspaces and local scratch
+aqos-agent-runs/
+.kilo/
+tmp/

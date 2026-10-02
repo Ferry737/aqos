@@ -1,0 +1,633 @@
+{
+  "id": "AQOS05ExecDisptc",
+  "name": "AQOS-05 Execution dispatch",
+  "active": false,
+  "nodes": [
+    {
+      "id": "10a33548-4b75-49b6-8375-ea45526f0bdb",
+      "name": "Approved decisions in",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "inputSource": "passthrough"
+      }
+    },
+    {
+      "id": "d67bc618-e23c-491a-87cd-50e13df1b3f5",
+      "name": "EMS breaker state",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        280,
+        0
+      ],
+      "parameters": {
+        "operation": "get",
+        "propertyName": "ems_breaker",
+        "key": "aqos:breaker:ems",
+        "keyType": "string"
+      },
+      "credentials": {
+        "redis": {
+          "id": "aqosCredRedis0000",
+          "name": "AQOS Redis"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 500,
+      "executeOnce": true
+    },
+    {
+      "id": "a4f774f1-7519-456b-85fb-1f522b7ac18a",
+      "name": "Global mode re-check",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        560,
+        0
+      ],
+      "parameters": {
+        "operation": "get",
+        "propertyName": "redis_mode",
+        "key": "aqos:mode:global",
+        "keyType": "string"
+      },
+      "credentials": {
+        "redis": {
+          "id": "aqosCredRedis0000",
+          "name": "AQOS Redis"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 500,
+      "executeOnce": true
+    },
+    {
+      "id": "6903be75-a34d-45a5-84b7-3ace435d217d",
+      "name": "Prepare dispatch",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        840,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Defence in depth before anything leaves the building: re-read the fast\n// global flag and the EMS circuit breaker after the gate decided, then pick\n// an execution algorithm from urgency and size. Skipped decisions expire\n// unused; the next cycle re-evaluates from scratch.\nconst RANK = { NORMAL: 0, REDUCE_ONLY: 1, HALT: 2 };\n\nfunction algoFor(d) {\n  const notional = Number(d.approved_qty) * Number(d.mark_px ?? 0);\n  if (d.urgency === 'high') return { algo: 'IS', algo_params: { horizon_s: 120, max_participation: 0.15 } };\n  if (d.urgency === 'low') return { algo: 'PASSIVE_LIMIT', algo_params: { post_only: true, reprice_s: 30, ttl_s: 1800, fallback: 'TWAP' } };\n  return notional > 25_000\n    ? { algo: 'TWAP', algo_params: { horizon_s: 900, slices: 15, max_participation: 0.1, limit_offset_bps: 5 } }\n    : { algo: 'LIMIT_LADDER', algo_params: { levels: 3, max_slippage_bps: 8, ttl_s: 120 } };\n}\n\nconst decisions = $('Approved decisions in').all().map((i) => i.json);\nconst modeRaw = String($('Global mode re-check').first().json.redis_mode ?? 'NORMAL').toUpperCase();\nconst mode = modeRaw in RANK ? modeRaw : 'HALT';\nconst breakerOpen = String($('EMS breaker state').first().json.ems_breaker ?? '').toUpperCase() === 'OPEN';\nconst dispatch = [];\nconst skipped = [];\nfor (const d of decisions) {\n  if (!d.decision_id) continue;\n  if (RANK[mode] >= RANK.HALT) skipped.push({ decision_id: d.decision_id, reason: 'global_halt_after_gate' });\n  else if (RANK[mode] === RANK.REDUCE_ONLY && d.reduce_only !== true) skipped.push({ decision_id: d.decision_id, reason: 'reduce_only_after_gate' });\n  else if (breakerOpen) skipped.push({ decision_id: d.decision_id, reason: 'ems_circuit_open' });\n  else {\n    dispatch.push({\n      decision_id: d.decision_id, account_id: d.account_id, venue: d.venue, symbol: d.symbol, side: d.side,\n      qty: Number(d.approved_qty), order_type: d.order_type ?? 'LIMIT', limit_px: d.limit_px != null ? Number(d.limit_px) : null,\n      arrival_mid: d.mark_px != null ? Number(d.mark_px) : null, ...algoFor(d),\n    });\n  }\n}\nreturn [{\n  json: {\n    dispatch, skipped, mode, breaker_open: breakerOpen,\n    skipped_ids: skipped.map((s) => s.decision_id),\n    skip_reason: [...new Set(skipped.map((s) => s.reason))].join(','),\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "893b9e34-b2a4-40a1-8e8d-756b640ad409",
+      "name": "Any skipped?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1120,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "23cce90c-74e0-4ba8-86b1-f4fd2d607d4e",
+              "leftValue": "={{ $json.skipped_ids.length }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "f97980d4-cd5d-4179-8be8-376ee7546709",
+      "name": "Mark not dispatched",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1400,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT risk.mark_not_dispatched($1::jsonb) AS r",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ decision_ids: $json.skipped_ids, reason: $json.skip_reason }) }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "aqosCredPgMain00",
+          "name": "AQOS Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "dfd35109-5549-47f7-8c24-43acb4a7035e",
+      "name": "Any to dispatch?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1120,
+        150
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "3abded9e-2ac3-4137-8c69-3646d51551a8",
+              "leftValue": "={{ $json.dispatch.length }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "1ed7e985-8a3f-4e95-8e93-d59a1c1eb5c8",
+      "name": "Register parent orders",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1400,
+        150
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM oms.submit_parent_orders($1::jsonb)",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ orders: $(\"Prepare dispatch\").first().json.dispatch }) }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "aqosCredPgMain00",
+          "name": "AQOS Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000,
+      "notes": "Consumes each risk token atomically; refuses expired, mismatched or reused tokens. parent_order_id = decision_id.",
+      "notesInFlow": false
+    },
+    {
+      "id": "e3e91e33-876f-4c57-8ba8-452bbaca45e8",
+      "name": "EMS batch",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// One batch request to the EMS. parent_order_id equals the risk decision id,\n// so a retried POST is idempotent end to end.\nconst rows = $input.all().map((i) => i.json).filter((r) => r.parent_order_id);\nconst n = (x) => (x === null || x === undefined ? null : Number(x));\nconst orders = rows.map((r) => ({\n  parent_order_id: r.parent_order_id,\n  account_id: r.account_id,\n  strategy_id: r.strategy_id,\n  venue: r.venue,\n  symbol: r.symbol,\n  side: r.side,\n  qty: n(r.qty),\n  order_type: r.order_type,\n  limit_px: n(r.limit_px),\n  reduce_only: r.reduce_only === true,\n  algo: r.algo,\n  algo_params: r.algo_params ?? {},\n  urgency: r.urgency,\n  pair_id: r.pair_id ?? null,\n  arrival_mid: n(r.arrival_mid),\n}));\nconst ids = orders.map((o) => o.parent_order_id);\nreturn [{\n  json: {\n    ids,\n    payload: { request_id: `dispatch:${ids[0]}:${ids.length}`, sent_at: new Date().toISOString(), orders },\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "e3d9dca2-5aa4-4dde-8a0c-4a8de4a38d4d",
+      "name": "Send to EMS",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1960,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://ems:8080/v1/orders/batch",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.payload) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "aqosCredEmsAuth00",
+          "name": "AQOS EMS Token"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 1000,
+      "onError": "continueErrorOutput",
+      "notes": "Idempotent: the EMS de-duplicates on parent_order_id.",
+      "notesInFlow": false
+    },
+    {
+      "id": "7a6e6c5a-38b5-4d0f-8437-02f61cfb23a7",
+      "name": "Mark sent",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        2240,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT oms.mark_sent($1::jsonb) AS r",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ parent_order_ids: $(\"EMS batch\").first().json.ids }) }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "aqosCredPgMain00",
+          "name": "AQOS Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "09062ef8-9362-467a-8adf-cd6c7505c5fb",
+      "name": "Reset breaker counter",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        2520,
+        0
+      ],
+      "parameters": {
+        "operation": "delete",
+        "key": "aqos:breaker:ems_fails"
+      },
+      "credentials": {
+        "redis": {
+          "id": "aqosCredRedis0000",
+          "name": "AQOS Redis"
+        }
+      }
+    },
+    {
+      "id": "f5ad0b55-a025-4abb-8389-a43b0176cd82",
+      "name": "Count EMS failure",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        2240,
+        150
+      ],
+      "parameters": {
+        "operation": "incr",
+        "key": "aqos:breaker:ems_fails",
+        "expire": true,
+        "ttl": 120
+      },
+      "credentials": {
+        "redis": {
+          "id": "aqosCredRedis0000",
+          "name": "AQOS Redis"
+        }
+      }
+    },
+    {
+      "id": "5e4d938e-2837-48fa-86a1-15c4c6f611bd",
+      "name": "Breaker",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2520,
+        150
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// EMS link circuit breaker. Redis INCR returns { \"<key>\": count } over a\n// sliding 120 s window. Three failures open the breaker for 30 s; while open,\n// dispatches are skipped. The first dispatch after the cooldown is the\n// half-open probe, and a success resets the counter.\nconst FAILS_TO_OPEN = 3;\nconst j = $input.first().json;\nconst fails = Number(Object.values(j)[0] ?? 0);\nconst ids = $('EMS batch').first().json.ids ?? [];\nreturn [{\n  json: {\n    severity: 'SEV1',\n    fails,\n    open: fails >= FAILS_TO_OPEN,\n    parent_order_ids: ids,\n    text: `[SEV1] EMS dispatch failed (${fails} in 120 s). ${ids.length} order(s) marked SEND_UNCONFIRMED; `\n      + `${fails >= FAILS_TO_OPEN ? 'circuit OPEN for 30 s.' : 'circuit still closed.'}`,\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "4f1fd1ce-d2e5-4945-8c8a-411930346e38",
+      "name": "Mark unconfirmed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        2800,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT oms.mark_unconfirmed($1::jsonb) AS r",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ parent_order_ids: $json.parent_order_ids, reason: 'ems_send_failed' }) }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "aqosCredPgMain00",
+          "name": "AQOS Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "5fa7598d-d397-4d4d-8e7c-e669ed0e400a",
+      "name": "Breaker open?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        2800,
+        150
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "739b52a4-eec4-4143-848d-57128d9aacbe",
+              "leftValue": "={{ $json.open }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "97571999-ec95-4379-894e-367ab2786e76",
+      "name": "Open breaker",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        3080,
+        0
+      ],
+      "parameters": {
+        "operation": "set",
+        "key": "aqos:breaker:ems",
+        "value": "OPEN",
+        "keyType": "string",
+        "expire": true,
+        "ttl": 30
+      },
+      "credentials": {
+        "redis": {
+          "id": "aqosCredRedis0000",
+          "name": "AQOS Redis"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 500
+    },
+    {
+      "id": "ddfa2873-15fb-4e3f-832b-269e625e4c7d",
+      "name": "Notify",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.4,
+      "position": [
+        2800,
+        300
+      ],
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "AQOS16Notifier00",
+          "mode": "id"
+        },
+        "mode": "once",
+        "options": {
+          "waitForSubWorkflow": false
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Approved decisions in": {
+      "main": [
+        [
+          {
+            "node": "EMS breaker state",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "EMS breaker state": {
+      "main": [
+        [
+          {
+            "node": "Global mode re-check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Global mode re-check": {
+      "main": [
+        [
+          {
+            "node": "Prepare dispatch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare dispatch": {
+      "main": [
+        [
+          {
+            "node": "Any skipped?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Any to dispatch?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Any skipped?": {
+      "main": [
+        [
+          {
+            "node": "Mark not dispatched",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Any to dispatch?": {
+      "main": [
+        [
+          {
+            "node": "Register parent orders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Register parent orders": {
+      "main": [
+        [
+          {
+            "node": "EMS batch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "EMS batch": {
+      "main": [
+        [
+          {
+            "node": "Send to EMS",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send to EMS": {
+      "main": [
+        [
+          {
+            "node": "Mark sent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Count EMS failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark sent": {
+      "main": [
+        [
+          {
+            "node": "Reset breaker counter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Count EMS failure": {
+      "main": [
+        [
+          {
+            "node": "Breaker",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Breaker": {
+      "main": [
+        [
+          {
+            "node": "Mark unconfirmed",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Breaker open?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Notify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Breaker open?": {
+      "main": [
+        [
+          {
+            "node": "Open breaker",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "UTC",
+    "saveDataErrorExecution": "all",
+    "saveManualExecutions": false,
+    "errorWorkflow": "AQOS13ErrorHandl",
+    "executionTimeout": 120
+  },
+  "pinData": {},
+  "tags": [
+    {
+      "name": "aqos"
+    }
+  ],
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}

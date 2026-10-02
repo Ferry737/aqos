@@ -1,0 +1,94 @@
+# AQOS control plane: n8n in queue mode + Postgres + Redis.
+# Single-host reference deployment. For production availability see
+# docs/blueprint.md section 5 (multi-main needs an n8n license; Postgres and
+# Redis should be managed/replicated services, not containers).
+#
+#   cp deploy/.env.example deploy/.env   # then fill in secrets
+#   docker compose -f deploy/docker-compose.yml --env-file deploy/.env up -d
+#
+# The custom services the workflows call (stream-gw, model-svc, portfolio-svc,
+# risk-svc, ems, ems-standby, data-adapter) are NOT included: they are the
+# custom development listed in docs/feasibility.json.
+x-n8n-env: &n8n-env
+  DB_TYPE: postgresdb
+  DB_POSTGRESDB_HOST: postgres
+  DB_POSTGRESDB_PORT: 5432
+  DB_POSTGRESDB_DATABASE: ${POSTGRES_DB:-aqos}
+  DB_POSTGRESDB_USER: ${POSTGRES_USER:-aqos}
+  DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+  N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+  EXECUTIONS_MODE: queue
+  QUEUE_BULL_REDIS_HOST: redis
+  QUEUE_BULL_REDIS_PORT: 6379
+  GENERIC_TIMEZONE: UTC
+  TZ: UTC
+  WEBHOOK_URL: ${N8N_PUBLIC_URL}
+  # Durable scheduler: each schedule fires once across instances and missed runs
+  # follow the per-trigger misfire policy. It needs the publication service too.
+  N8N_SCHEDULER_ENABLED: "true"
+  N8N_USE_WORKFLOW_PUBLICATION_SERVICE: "true"
+  N8N_SCHEDULER_MISFIRE_GRACE: 60
+  # Keep the database small: only failed executions are kept long; successes of
+  # high-frequency workflows are not saved at all (workflow settings).
+  EXECUTIONS_DATA_PRUNE: "true"
+  EXECUTIONS_DATA_MAX_AGE: 168
+  N8N_METRICS: "true"
+  N8N_LOG_LEVEL: info
+  N8N_DIAGNOSTICS_ENABLED: "false"
+
+services:
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-aqos}
+      POSTGRES_USER: ${POSTGRES_USER:-aqos}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-aqos}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  n8n-main:
+    image: n8nio/n8n:2.41.5
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    environment:
+      <<: *n8n-env
+    ports:
+      - "5678:5678"
+    volumes:
+      - n8ndata:/home/node/.n8n
+
+  n8n-worker:
+    image: n8nio/n8n:2.41.5
+    restart: unless-stopped
+    command: worker --concurrency=10
+    depends_on:
+      - n8n-main
+    environment:
+      <<: *n8n-env
+    deploy:
+      replicas: 2
+
+volumes:
+  pgdata:
+  redisdata:
+  n8ndata:

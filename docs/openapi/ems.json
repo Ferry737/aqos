@@ -1,0 +1,590 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "EMS service contract",
+    "version": "1.0.0",
+    "description": "Execution Management Service (ems): order ingress, kill switch, exposure, venue snapshots and API-key operations, as consumed by the n8n workflows. All calls are JSON over HTTP and must carry `Authorization: Bearer <token>` (n8n \"Header Auth\" credential); a request without a valid token gets HTTP 401. Errors are returned as `{ \"error\": { \"code\": \"...\", \"message\": \"...\" } }`."
+  },
+  "servers": [
+    { "url": "http://ems:8080", "description": "EMS (internal cluster address)" }
+  ],
+  "security": [
+    { "bearerAuth": [] }
+  ],
+  "tags": [
+    { "name": "orders", "description": "Order ingress and idempotent kills" },
+    { "name": "state", "description": "Exposure, venue snapshots and key operations" }
+  ],
+  "paths": {
+    "/v1/orders/batch": {
+      "post": {
+        "tags": ["orders"],
+        "operationId": "postOrdersBatch",
+        "summary": "Submit a batch of orders",
+        "description": "Submit a batch of orders for placement across venues. Idempotent on `parent_order_id`: re-sending a `parent_order_id` that EMS has already accepted reports that id under `duplicates` and never creates a second order. Orders that cannot be accepted are reported under `rejected` with a `reason`.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/OrderBatchRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Every order in the batch was accepted, was a known duplicate, or was rejected.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/OrderBatchResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "422": { "$ref": "#/components/responses/UnprocessableEntity" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      }
+    },
+    "/v1/kill": {
+      "post": {
+        "tags": ["orders"],
+        "operationId": "postKill",
+        "summary": "Halt, cancel or flatten by scope",
+        "description": "Apply a kill action (`halt_new`, `cancel_all`, `flatten`) to `global` scope or to one account, strategy or venue via `scope_id`. Idempotent on `request_id`: re-sending the same `request_id` reports `duplicate: true` and does not re-apply the action or re-count cancellations.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/KillRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Kill action applied, or recognised as a duplicate of an earlier request.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/KillResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "422": { "$ref": "#/components/responses/UnprocessableEntity" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      }
+    },
+    "/v1/exposure": {
+      "post": {
+        "tags": ["state"],
+        "operationId": "postExposure",
+        "summary": "Read open exposure for a scope",
+        "description": "Return the open orders and gross notional (USD) for a `global`, `account`, `strategy` or `venue` scope. Read-only.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ExposureRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Exposure for the requested scope.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ExposureResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "422": { "$ref": "#/components/responses/UnprocessableEntity" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      }
+    },
+    "/v1/snapshots": {
+      "post": {
+        "tags": ["state"],
+        "operationId": "postSnapshots",
+        "summary": "Snapshot account positions from the venues",
+        "description": "Reconcile state by reading positions and external order/fill counts directly from the venues for the requested accounts (`\"all\"` for every configured account).",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/SnapshotsRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Venue-sourced snapshot for each account.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SnapshotsResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "422": { "$ref": "#/components/responses/UnprocessableEntity" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      }
+    },
+    "/v1/keys/inspect": {
+      "post": {
+        "tags": ["state"],
+        "operationId": "postKeysInspect",
+        "summary": "Inspect a venue API key's permissions",
+        "description": "Read trading, withdrawal, transfer, IP-restriction and futures permissions for `key_ref` from the venue itself (never from local config). Use before any withdrawal or transfer operation.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/KeysInspectRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Permissions reported by the venue.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/KeysInspectResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "422": { "$ref": "#/components/responses/UnprocessableEntity" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      }
+    },
+    "/v1/keys/destroy": {
+      "post": {
+        "tags": ["state"],
+        "operationId": "postKeysDestroy",
+        "summary": "Destroy a venue API key",
+        "description": "Revoke `key_ref` at the venue and remove it from the credential store. Irreversible; only call after `POST /v1/keys/inspect` has confirmed the key is no longer needed.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/KeysDestroyRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Key destroyed.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/KeysDestroyResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "422": { "$ref": "#/components/responses/UnprocessableEntity" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      }
+    }
+  },
+  "webhooks": {
+    "aqos-event": {
+      "post": {
+        "operationId": "onAqosEvent",
+        "summary": "Signed aqos-event pushed to the n8n webhook endpoint",
+        "description": "aqos POSTs each event to `https://<n8n>/webhook/aqos/events` with the header `x-aqos-signature: sha256=<lowercase hex HMAC-SHA256 of the exact raw body>`. The receiver must recompute the HMAC-SHA256 over the raw, unmodified request body and compare it in constant time before parsing; an event whose `ts` is more than 30 s away from delivery time, or whose `event_id` was already processed, must be dropped. This webhook is unauthenticated by bearer token; the HMAC signature header is the authentication and integrity mechanism.",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/AqosEvent" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Event accepted (or idempotently ignored). No body required." },
+          "401": { "$ref": "#/components/responses/BadSignature" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "n8n \"Header Auth\" credential: `Authorization: Bearer <token>`. A request without a valid token gets HTTP 401."
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "description": "Every 4xx/5xx response body.",
+        "properties": {
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": { "type": "string", "description": "Stable machine-readable error code." },
+              "message": { "type": "string", "description": "Human-readable explanation." }
+            },
+            "required": ["code", "message"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["error"],
+        "additionalProperties": false
+      },
+      "Side": {
+        "type": "string",
+        "description": "Order side.",
+        "enum": ["BUY", "SELL"]
+      },
+      "Order": {
+        "type": "object",
+        "description": "One order in a batch. Idempotency key is `parent_order_id`: EMS keeps a ledger of accepted ids, so re-sending an id already in the ledger reports it under `duplicates` and creates no second order.",
+        "properties": {
+          "parent_order_id": {
+            "type": "string",
+            "description": "Client-assigned unique id. Idempotency key: a repeat of an already-accepted `parent_order_id` is reported under `duplicates` and never creates a second order."
+          },
+          "account_id": { "type": "string" },
+          "strategy_id": { "type": "string" },
+          "venue": { "type": "string", "description": "Venue id, e.g. `binance`, `bybit`." },
+          "symbol": { "type": "string" },
+          "side": { "$ref": "#/components/schemas/Side" },
+          "qty": { "type": "number" },
+          "order_type": { "type": "string", "description": "e.g. LIMIT, MARKET." },
+          "limit_px": { "type": ["number", "null"], "description": "Limit price; null for market orders." },
+          "reduce_only": { "type": "boolean" },
+          "algo": { "type": ["string", "null"], "description": "Algo execution style, e.g. TWAP, VWAP, ICEBERG; null for plain orders." },
+          "algo_params": {
+            "type": ["object", "null"],
+            "description": "Parameters for `algo` (e.g. slices, duration).",
+            "additionalProperties": true
+          },
+          "urgency": { "type": "string", "description": "Urgency hint, e.g. LOW, NORMAL, HIGH, URGENT." },
+          "pair_id": { "type": ["string", "null"], "description": "Pairs the two legs of a hedge; null when unpaired." },
+          "arrival_mid": { "type": ["number", "null"], "description": "Arrival mid captured by the caller, for slippage attribution." }
+        },
+        "required": [
+          "parent_order_id",
+          "account_id",
+          "strategy_id",
+          "venue",
+          "symbol",
+          "side",
+          "qty",
+          "order_type",
+          "reduce_only",
+          "urgency"
+        ],
+        "additionalProperties": false
+      },
+      "OrderBatchRequest": {
+        "type": "object",
+        "properties": {
+          "request_id": { "type": "string", "description": "Unique id of this batch submission, echoed back in the response." },
+          "sent_at": { "type": "string", "format": "date-time", "description": "ISO-8601 time the batch was sent." },
+          "orders": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Order" }
+          }
+        },
+        "required": ["request_id", "sent_at", "orders"],
+        "additionalProperties": false
+      },
+      "OrderBatchResponse": {
+        "type": "object",
+        "properties": {
+          "request_id": { "type": "string" },
+          "accepted": {
+            "type": "array",
+            "description": "`parent_order_id` values newly accepted by EMS.",
+            "items": { "type": "string" }
+          },
+          "duplicates": {
+            "type": "array",
+            "description": "`parent_order_id` values already accepted earlier; no new order was created for them.",
+            "items": { "type": "string" }
+          },
+          "rejected": {
+            "type": "array",
+            "description": "Orders EMS refused, with a reason.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "parent_order_id": { "type": "string" },
+                "reason": { "type": "string" }
+              },
+              "required": ["parent_order_id", "reason"],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": ["request_id", "accepted", "duplicates", "rejected"],
+        "additionalProperties": false
+      },
+      "KillRequest": {
+        "type": "object",
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "description": "Idempotency key for the kill action: re-sending the same `request_id` reports `duplicate: true` and neither re-applies the action nor re-counts cancellations."
+          },
+          "scope": {
+            "type": "string",
+            "description": "Kill scope.",
+            "enum": ["global", "account", "strategy", "venue"]
+          },
+          "scope_id": {
+            "type": ["string", "null"],
+            "description": "Account, strategy or venue id the scope applies to; required for every scope except `global`, where it may be null."
+          },
+          "action": {
+            "type": "string",
+            "description": "What the kill does.",
+            "enum": ["halt_new", "cancel_all", "flatten"]
+          },
+          "reason": { "type": "string", "description": "Why the kill was issued." }
+        },
+        "required": ["request_id", "scope", "action", "reason"],
+        "additionalProperties": false
+      },
+      "KillResponse": {
+        "type": "object",
+        "properties": {
+          "request_id": { "type": "string" },
+          "status": { "type": "string", "description": "Resulting kill state, e.g. `applied`, `already_flat`, `halted`." },
+          "cancelled_orders": { "type": "integer", "description": "Number of orders cancelled by this call." },
+          "duplicate": { "type": "boolean", "description": "True when this `request_id` was already applied." }
+        },
+        "required": ["request_id", "status", "cancelled_orders", "duplicate"],
+        "additionalProperties": false
+      },
+      "ExposureRequest": {
+        "type": "object",
+        "properties": {
+          "scope": { "type": "string", "enum": ["global", "account", "strategy", "venue"] },
+          "scope_id": { "type": ["string", "null"] }
+        },
+        "required": ["scope"],
+        "additionalProperties": false
+      },
+      "ExposureResponse": {
+        "type": "object",
+        "properties": {
+          "open_orders": { "type": "integer" },
+          "gross_notional_usd": { "type": "number" }
+        },
+        "required": ["open_orders", "gross_notional_usd"],
+        "additionalProperties": false
+      },
+      "Position": {
+        "type": "object",
+        "description": "A venue position for one symbol.",
+        "properties": {
+          "symbol": { "type": "string" },
+          "qty": { "type": "number", "description": "Signed quantity; negative means short." }
+        },
+        "required": ["symbol", "qty"],
+        "additionalProperties": false
+      },
+      "SnapshotsRequest": {
+        "type": "object",
+        "properties": {
+          "accounts": { "type": "string", "description": "\"all\" to snapshot every configured account.", "const": "all" }
+        },
+        "required": ["accounts"],
+        "additionalProperties": false
+      },
+      "SnapshotsResponse": {
+        "type": "object",
+        "properties": {
+          "accounts": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "account_id": { "type": "string" },
+                "venue": { "type": "string" },
+                "positions": { "type": "array", "items": { "$ref": "#/components/schemas/Position" } },
+                "external_orders_count": { "type": "integer", "description": "Open orders the venue knows about but EMS does not." },
+                "external_fills_count": { "type": "integer", "description": "Fills the venue knows about but EMS does not." }
+              },
+              "required": ["account_id", "venue", "positions", "external_orders_count", "external_fills_count"],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": ["accounts"],
+        "additionalProperties": false
+      },
+      "KeysInspectRequest": {
+        "type": "object",
+        "properties": {
+          "venue": { "type": "string" },
+          "key_ref": { "type": "string", "description": "Reference to the credential, never the raw secret." }
+        },
+        "required": ["venue", "key_ref"],
+        "additionalProperties": false
+      },
+      "KeysInspectResponse": {
+        "type": "object",
+        "properties": {
+          "can_trade": { "type": "boolean" },
+          "can_withdraw": { "type": "boolean" },
+          "can_transfer": { "type": "boolean" },
+          "ip_restricted": { "type": "boolean" },
+          "futures_enabled": { "type": "boolean" }
+        },
+        "required": ["can_trade", "can_withdraw", "can_transfer", "ip_restricted", "futures_enabled"],
+        "additionalProperties": false
+      },
+      "KeysDestroyRequest": {
+        "type": "object",
+        "properties": {
+          "key_ref": { "type": "string", "description": "Reference to the credential to revoke." }
+        },
+        "required": ["key_ref"],
+        "additionalProperties": false
+      },
+      "KeysDestroyResponse": {
+        "type": "object",
+        "properties": {
+          "destroyed": { "type": "boolean", "const": true }
+        },
+        "required": ["destroyed"],
+        "additionalProperties": false
+      },
+      "AqosEvent": {
+        "type": "object",
+        "description": "Envelope of every signed event pushed to `POST https://<n8n>/webhook/aqos/events`. Authenticate with the header `x-aqos-signature: sha256=<lowercase hex HMAC-SHA256 of the exact raw body>`.",
+        "properties": {
+          "event_id": { "type": "string", "description": "Unique event id, used to drop repeats." },
+          "source": { "type": "string", "description": "Producing component, e.g. aqos, ems, risk-svc." },
+          "type": {
+            "type": "string",
+            "description": "Selects the payload variant.",
+            "enum": ["bar_close", "market_stress", "execution_events", "feed_status"]
+          },
+          "ts": { "type": "string", "format": "date-time", "description": "ISO-8601 event time; must be within 30 s of delivery." },
+          "payload": {
+            "description": "Payload shape is determined by `type`.",
+            "oneOf": [
+              { "$ref": "#/components/schemas/BarClosePayload" },
+              { "$ref": "#/components/schemas/MarketStressPayload" },
+              { "$ref": "#/components/schemas/ExecutionEventsPayload" },
+              { "$ref": "#/components/schemas/FeedStatusPayload" }
+            ]
+          }
+        },
+        "required": ["event_id", "source", "type", "ts", "payload"],
+        "additionalProperties": false
+      },
+      "BarClosePayload": {
+        "type": "object",
+        "description": "Payload for `type: bar_close`.",
+        "properties": {
+          "bar_ts": { "type": "string", "format": "date-time" },
+          "timeframe": { "type": "string", "const": "5m" }
+        },
+        "required": ["bar_ts", "timeframe"],
+        "additionalProperties": false
+      },
+      "MarketStressPayload": {
+        "type": "object",
+        "description": "Payload for `type: market_stress`.",
+        "properties": {
+          "reason": { "type": "string" },
+          "severity": { "type": "string", "description": "Stress severity, e.g. `warn`, `critical`." }
+        },
+        "required": ["reason", "severity"],
+        "additionalProperties": false
+      },
+      "ExecutionEvent": {
+        "type": "object",
+        "properties": {
+          "event_id": { "type": "string" },
+          "type": {
+            "type": "string",
+            "enum": [
+              "ACK",
+              "WORKING",
+              "PARTIAL_FILL",
+              "FILL",
+              "CANCELLED",
+              "REJECTED",
+              "EXPIRED",
+              "LIQUIDATION",
+              "ADL",
+              "FUNDING",
+              "FEE"
+            ]
+          },
+          "parent_order_id": { "type": "string" },
+          "account_id": { "type": "string" },
+          "venue": { "type": "string" },
+          "symbol": { "type": "string" },
+          "side": { "$ref": "#/components/schemas/Side" },
+          "qty": { "type": "number" },
+          "px": { "type": ["number", "null"] },
+          "fee_usd": { "type": ["number", "null"] },
+          "ts": { "type": "string", "format": "date-time" },
+          "reason": { "type": ["string", "null"] }
+        },
+        "required": ["event_id", "type", "parent_order_id", "account_id", "venue", "symbol", "side", "qty", "ts"],
+        "additionalProperties": false
+      },
+      "ExecutionEventsPayload": {
+        "type": "object",
+        "description": "Payload for `type: execution_events`.",
+        "properties": {
+          "events": { "type": "array", "items": { "$ref": "#/components/schemas/ExecutionEvent" } }
+        },
+        "required": ["events"],
+        "additionalProperties": false
+      },
+      "FeedStatusPayload": {
+        "type": "object",
+        "description": "Payload for `type: feed_status`.",
+        "properties": {
+          "feed_id": { "type": "string" },
+          "venue": { "type": "string" },
+          "symbol": { "type": "string" },
+          "critical": { "type": "boolean", "description": "True when the feed is critical to trading." },
+          "status": {
+            "type": "string",
+            "enum": ["stale", "gap", "checksum_mismatch", "crossed_book", "outlier", "recovered"]
+          },
+          "detail": { "type": ["string", "null"] }
+        },
+        "required": ["feed_id", "venue", "symbol", "critical", "status"],
+        "additionalProperties": false
+      }
+    },
+    "responses": {
+      "Unauthorized": {
+        "description": "Missing or invalid bearer token.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "BadSignature": {
+        "description": "`x-aqos-signature` header missing or not matching the HMAC-SHA256 of the raw body.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "UnprocessableEntity": {
+        "description": "Body parsed but semantically invalid (bad enum, violated constraint, unknown scope).",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "ServiceUnavailable": {
+        "description": "A downstream venue or dependency is unavailable; retry with backoff.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      }
+    }
+  }
+}

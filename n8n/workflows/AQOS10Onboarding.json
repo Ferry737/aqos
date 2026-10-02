@@ -1,0 +1,927 @@
+{
+  "id": "AQOS10Onboarding",
+  "name": "AQOS-10 Client onboarding",
+  "active": true,
+  "nodes": [
+    {
+      "id": "f8b86fef-0496-4844-8261-8c127576bfb8",
+      "name": "Signup",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "aqos/signup",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "aqosCredInbound00",
+          "name": "AQOS Inbound Webhook Token"
+        }
+      }
+    },
+    {
+      "id": "186d9eed-11d8-4734-8cbe-b6bddc72765c",
+      "name": "Validate signup",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        280,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Onboarding policy. These are product guardrails, not investment advice:\n//  * blocked jurisdictions are refused (list owned by compliance; the KYC\n//    provider also screens addresses for sanctioned regions)\n//  * where the platform's derivatives venues are not available to retail\n//    clients, derivatives strategies are disabled\n//  * the appropriateness score caps the risk profile; everyone starts in PAPER\n//  * every required disclosure must be accepted, version and hash recorded\nconst BLOCKED = new Set(['KP', 'IR', 'CU']);                  // illustrative; compliance maintains\nconst NO_RETAIL_DERIVATIVES = new Set(['GB', 'US']);          // illustrative; see the jurisdiction matrix\nconst REQUIRED_DOCS = ['terms', 'risk_disclosure', 'privacy', 'non_advice_ack', 'fee_schedule'];\n\nfunction score(q) {\n  const exp = { none: 0, lt1: 10, '1to3': 20, gt3: 30 }[q?.experience] ?? 0;\n  const quiz = Math.max(0, Math.min(8, Number(q?.quiz_correct ?? 0)));\n  const knowledge = Math.round((quiz / 8) * 50);\n  const capacity = q?.can_bear_total_loss === true ? 20 : 0;\n  return { total: exp + knowledge + capacity, quizPassed: quiz >= 6 };\n}\n\nconst b = $input.first().json.body ?? {};\nconst errors = [];\nconst email = String(b.email ?? '').trim().toLowerCase();\nif (!/^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$/.test(email)) errors.push('invalid_email');\nconst jurisdiction = String(b.jurisdiction ?? '').toUpperCase().slice(0, 5);\nif (!/^[A-Z]{2}(-[A-Z0-9]{1,2})?$/.test(jurisdiction)) errors.push('invalid_jurisdiction');\nconst consents = Array.isArray(b.consents) ? b.consents : [];\nfor (const doc of REQUIRED_DOCS) {\n  const c = consents.find((x) => x?.doc_type === doc);\n  if (!c || !c.doc_version || !/^[0-9a-f]{64}$/i.test(String(c.doc_sha256 ?? ''))) errors.push(`missing_consent_${doc}`);\n}\nconst s = score(b.questionnaire);\nconst share = Number(b.questionnaire?.share_of_liquid_net_worth_pct ?? 100);\nlet riskProfile = 'CONSERVATIVE';\nif (b.questionnaire?.can_bear_total_loss === true) {\n  if (s.total >= 75 && share <= 25) riskProfile = 'DYNAMIC';\n  else if (s.total >= 55) riskProfile = 'BALANCED';\n}\nconst country = jurisdiction.split('-')[0];\nconst blocked = BLOCKED.has(country);\nreturn [{\n  json: {\n    valid: errors.length === 0,\n    errors,\n    blocked,\n    blocked_reason: blocked ? 'jurisdiction_not_served' : null,\n    screening_request: { full_name: String(b.full_name ?? '').slice(0, 200), date_of_birth: b.date_of_birth ?? null, country, external_ref: b.external_ref ?? null },\n    client: {\n      external_ref: b.external_ref ?? null,\n      email,\n      jurisdiction,\n      risk_profile: riskProfile,\n      appropriateness_score: s.total,\n      quiz_passed: s.quizPassed,\n      derivatives_allowed: !NO_RETAIL_DERIVATIVES.has(country) && riskProfile !== 'CONSERVATIVE',\n      tier: 'LAB',\n      consents: consents.filter((c) => REQUIRED_DOCS.includes(c?.doc_type)).map((c) => ({ doc_type: c.doc_type, doc_version: String(c.doc_version), doc_sha256: String(c.doc_sha256).toLowerCase() })),\n    },\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "413b73c0-8fd5-4ba4-82af-feb0ffa73698",
+      "name": "Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        560,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "eb850e3e-d0c0-4626-87c0-07c3b0de3e28",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "438cf443-480a-40d7-8df0-ed1de2a125e2",
+      "name": "Reject invalid",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        840,
+        0
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { ok: false, errors: $json.errors } }}",
+        "options": {
+          "responseCode": 422
+        }
+      }
+    },
+    {
+      "id": "a2457dad-1da2-495f-8193-6c628cd2866c",
+      "name": "Blocked jurisdiction?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        840,
+        150
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "f0d0aa68-2b55-481a-866d-2089420daa7e",
+              "leftValue": "={{ $json.blocked }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "a6f72842-920f-4562-826c-369974bbef18",
+      "name": "Record blocked applicant",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1120,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT biz.create_client($1::jsonb) AS r",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify(Object.assign({}, $json.client, { status: 'BLOCKED', screening: { result: 'JURISDICTION' } })) }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "aqosCredPgMain00",
+          "name": "AQOS Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "f6b8f06a-8bdc-4196-8f3f-8c19db5b0cc3",
+      "name": "Respond not served",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        1400,
+        0
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\"ok\":true,\"status\":\"unavailable\",\"message\":\"We are not able to offer this service in your region.\"}",
+        "options": {
+          "responseCode": 200
+        }
+      }
+    },
+    {
+      "id": "7084368d-a796-420b-89c2-96012403dea8",
+      "name": "Sanctions and PEP screening",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1120,
+        150
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://screening.example.com/v1/check",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.screening_request) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "aqosCredScreen000",
+          "name": "AQOS Screening Provider"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput",
+      "notes": "Third-party KYC/AML provider (custom integration). Result: CLEAR | REVIEW | HIT.",
+      "notesInFlow": false
+    },
+    {
+      "id": "6256dda2-c0c3-44a2-837b-2c2570f9fe74",
+      "name": "Screening outcome",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1400,
+        150
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Maps the sanctions/PEP screening result onto the client record. A hit is\n// never explained to the applicant (no tipping off); compliance reviews it.\nconst v = $('Validate signup').first().json;\nconst res = $input.first().json;\nconst result = String(res.result ?? (res.error ? 'ERROR' : 'REVIEW')).toUpperCase();\nconst status = { CLEAR: 'ACTIVE', REVIEW: 'PENDING_REVIEW', HIT: 'BLOCKED' }[result] ?? 'PENDING_REVIEW';\nreturn [{\n  json: {\n    route: status,\n    create: { ...v.client, status, screening: { provider_ref: res.reference ?? null, result, checked_at: new Date().toISOString() } },\n    email: v.client.email,\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "a23eb31c-e269-402f-8259-ec25064439a3",
+      "name": "Create client",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1680,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT biz.create_client($1::jsonb) AS r",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify($json.create) }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "aqosCredPgMain00",
+          "name": "AQOS Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "3631d9a2-adb6-4a64-8bca-1ad9aedeaf01",
+      "name": "Respond received",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        1960,
+        0
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { ok: true, status: $(\"Screening outcome\").first().json.route, client_id: $json.r.client_id } }}",
+        "options": {
+          "responseCode": 200
+        }
+      }
+    },
+    {
+      "id": "b6e45a0d-55fc-448f-8d9a-e909c24d117e",
+      "name": "Route by status",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        2240,
+        0
+      ],
+      "parameters": {
+        "mode": "rules",
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "2b2b3c86-7e99-4244-8b03-1e77fdaeedbb",
+                    "leftValue": "={{ $(\"Screening outcome\").first().json.route }}",
+                    "rightValue": "ACTIVE",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "active"
+            }
+          ]
+        },
+        "looseTypeValidation": true,
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "review"
+        }
+      }
+    },
+    {
+      "id": "0fdaa02a-3c3b-4010-86eb-cf431568effe",
+      "name": "Send welcome email",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        2520,
+        0
+      ],
+      "parameters": {
+        "fromEmail": "AQOS <no-reply@example.com>",
+        "toEmail": "={{ $(\"Screening outcome\").first().json.email }}",
+        "subject": "Welcome to AQOS: paper trading is ready",
+        "emailFormat": "html",
+        "html": "<p>Welcome to AQOS. Your account starts in <strong>paper trading</strong>: no real money is used until you complete the knowledge check, accept the risk disclosure, and connect a trade-only exchange key.</p><p>AQOS is software that runs strategies in your own exchange account. We never hold your funds. Nothing we send you is investment advice, and results can include total loss of capital.</p>",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "credentials": {
+        "smtp": {
+          "id": "aqosCredSmtp00000",
+          "name": "AQOS SMTP"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "id": "e30ef146-4abf-4dfb-8fe0-6a744eab2a45",
+      "name": "Compliance review notice",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.5,
+      "position": [
+        2520,
+        150
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "",
+              "name": "severity",
+              "value": "SEV3",
+              "type": "string"
+            },
+            {
+              "id": "",
+              "name": "text",
+              "value": "={{ \"[ONBOARDING] application held for compliance review: client \" + $json.r.client_id }}",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": false,
+        "options": {}
+      }
+    },
+    {
+      "id": "d972cf4d-a558-414f-8606-1f0889d175f1",
+      "name": "Key connected",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        150
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "aqos/keys",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "aqosCredInbound00",
+          "name": "AQOS Inbound Webhook Token"
+        }
+      },
+      "notes": "Called by the client portal after the key is stored in the vault. Body: { account_id, client_id, venue, key_ref, email, derivatives_allowed }.",
+      "notesInFlow": false
+    },
+    {
+      "id": "5590b276-e5ec-40a5-8b7d-be22cc2e3e19",
+      "name": "Inspect key permissions",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        280,
+        150
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://ems:8080/v1/keys/inspect",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ venue: $json.body.venue, key_ref: $json.body.key_ref }) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "aqosCredEmsAuth00",
+          "name": "AQOS EMS Token"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput",
+      "notes": "The EMS reads the key permissions from the venue itself; the portal is not trusted for this.",
+      "notesInFlow": false
+    },
+    {
+      "id": "8238c385-fd19-4710-8f12-9570f98a96ed",
+      "name": "Key policy",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        560,
+        150
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// API-key permission policy, checked against the venue itself (via the EMS):\n// trading allowed; withdrawals and internal transfers disabled; IP allowlist\n// set; futures only if the mandate allows derivatives. Anything else is\n// rejected and the stored key is destroyed.\nconst req = $('Key connected').first().json.body ?? {};\nconst perm = $input.first().json ?? {};\nconst reasons = [];\nif (perm.error) reasons.push('permission_check_failed');\nif (perm.can_trade !== true) reasons.push('trading_permission_missing');\nif (perm.can_withdraw !== false) reasons.push('withdrawals_must_be_disabled');\nif (perm.can_transfer === true) reasons.push('internal_transfers_must_be_disabled');\nif (perm.ip_restricted !== true) reasons.push('ip_allowlist_required');\nif (perm.futures_enabled === true && req.derivatives_allowed !== true) reasons.push('futures_permission_not_allowed_for_this_mandate');\nconst status = reasons.length ? 'REJECTED' : 'VERIFIED';\nconst fixes = {\n  trading_permission_missing: 'enable spot (and, if your plan includes it, futures) trading on the key',\n  withdrawals_must_be_disabled: 'create the key with withdrawals disabled',\n  internal_transfers_must_be_disabled: 'disable universal/internal transfer permission',\n  ip_allowlist_required: 'restrict the key to the IP addresses shown in your dashboard',\n  futures_permission_not_allowed_for_this_mandate: 'remove futures permission; derivatives are not enabled for your account',\n  permission_check_failed: 'retry in a few minutes; we could not reach the exchange',\n};\nreturn [{\n  json: {\n    account_id: req.account_id,\n    client_id: req.client_id,\n    venue: req.venue,\n    key_ref: req.key_ref,\n    email: req.email,\n    status,\n    permissions: perm,\n    reasons,\n    instructions: reasons.map((r) => fixes[r] ?? r),\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "2f7f365f-05b0-414e-80b2-e818ed5611c3",
+      "name": "Record key status",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        840,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT biz.mark_key_status($1::jsonb) AS r",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ account_id: $json.account_id, client_id: $json.client_id, venue: $json.venue, key_ref: $json.key_ref, status: $json.status, permissions: $json.permissions }) }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "aqosCredPgMain00",
+          "name": "AQOS Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "f6eb1d4e-d686-4f5e-8a30-545a4403c5e9",
+      "name": "Key verified?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1120,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "e6c54001-da96-41bd-8a2d-0d03b0551d23",
+              "leftValue": "={{ $(\"Key policy\").first().json.status }}",
+              "rightValue": "VERIFIED",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "b24d3262-4582-48c4-8610-103d82c747ed",
+      "name": "Respond verified",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        1400,
+        300
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{\"ok\":true,\"status\":\"VERIFIED\"}",
+        "options": {
+          "responseCode": 200
+        }
+      }
+    },
+    {
+      "id": "11d9ad0e-90af-4f0c-8b76-cbaba5c10567",
+      "name": "Destroy rejected key",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1400,
+        450
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://ems:8080/v1/keys/destroy",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ key_ref: $(\"Key policy\").first().json.key_ref }) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "aqosCredEmsAuth00",
+          "name": "AQOS EMS Token"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "81542cc3-d656-4879-83ba-b956b876c0a0",
+      "name": "Respond rejected",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        1680,
+        150
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { ok: false, status: \"REJECTED\", instructions: $(\"Key policy\").first().json.instructions } }}",
+        "options": {
+          "responseCode": 200
+        }
+      }
+    },
+    {
+      "id": "be3fd035-e341-4a7f-87af-49ac10d1c621",
+      "name": "Daily graduation check",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 0 9 * * *"
+            }
+          ]
+        },
+        "misfirePolicy": "skip",
+        "misfireGraceSeconds": 0
+      }
+    },
+    {
+      "id": "6a5c2e3c-3c70-46d3-86df-15bacc0df355",
+      "name": "Graduation candidates",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        280,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM biz.graduation_candidates($1::jsonb)",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ min_paper_days: 14 }) }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "aqosCredPgMain00",
+          "name": "AQOS Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "fc918d14-995c-4258-8b6c-de21237e9b96",
+      "name": "Send live-access invitation",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        560,
+        300
+      ],
+      "parameters": {
+        "fromEmail": "AQOS <no-reply@example.com>",
+        "toEmail": "={{ $json.email }}",
+        "subject": "You can now choose to go live",
+        "emailFormat": "html",
+        "html": "<p>You have completed the paper-trading period and the knowledge check. You can now choose to connect a live, trade-only exchange key from your dashboard (https://app.example.com).</p><p>Going live is optional. Review the fee schedule and risk disclosure again before you decide. AQOS does not provide investment advice.</p>",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "credentials": {
+        "smtp": {
+          "id": "aqosCredSmtp00000",
+          "name": "AQOS SMTP"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "id": "eb34fee8-958d-4af1-84bf-820710e464f0",
+      "name": "Notify",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.4,
+      "position": [
+        2800,
+        0
+      ],
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "AQOS16Notifier00",
+          "mode": "id"
+        },
+        "mode": "once",
+        "options": {
+          "waitForSubWorkflow": false
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Signup": {
+      "main": [
+        [
+          {
+            "node": "Validate signup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate signup": {
+      "main": [
+        [
+          {
+            "node": "Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Valid?": {
+      "main": [
+        [
+          {
+            "node": "Blocked jurisdiction?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reject invalid",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Blocked jurisdiction?": {
+      "main": [
+        [
+          {
+            "node": "Record blocked applicant",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Sanctions and PEP screening",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record blocked applicant": {
+      "main": [
+        [
+          {
+            "node": "Respond not served",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanctions and PEP screening": {
+      "main": [
+        [
+          {
+            "node": "Screening outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Screening outcome": {
+      "main": [
+        [
+          {
+            "node": "Create client",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create client": {
+      "main": [
+        [
+          {
+            "node": "Respond received",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond received": {
+      "main": [
+        [
+          {
+            "node": "Route by status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by status": {
+      "main": [
+        [
+          {
+            "node": "Send welcome email",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Compliance review notice",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compliance review notice": {
+      "main": [
+        [
+          {
+            "node": "Notify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Key connected": {
+      "main": [
+        [
+          {
+            "node": "Inspect key permissions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Inspect key permissions": {
+      "main": [
+        [
+          {
+            "node": "Key policy",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Key policy": {
+      "main": [
+        [
+          {
+            "node": "Record key status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record key status": {
+      "main": [
+        [
+          {
+            "node": "Key verified?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Key verified?": {
+      "main": [
+        [
+          {
+            "node": "Respond verified",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Destroy rejected key",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Destroy rejected key": {
+      "main": [
+        [
+          {
+            "node": "Respond rejected",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Daily graduation check": {
+      "main": [
+        [
+          {
+            "node": "Graduation candidates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Graduation candidates": {
+      "main": [
+        [
+          {
+            "node": "Send live-access invitation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "UTC",
+    "saveDataErrorExecution": "all",
+    "saveManualExecutions": false,
+    "errorWorkflow": "AQOS13ErrorHandl",
+    "executionTimeout": 120
+  },
+  "pinData": {},
+  "tags": [
+    {
+      "name": "aqos"
+    }
+  ],
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}

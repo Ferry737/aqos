@@ -1,0 +1,103 @@
+// WF-14 Kill switch: halt / cancel-all / flatten / reset for global, account,
+// strategy or venue scope. Idempotent per request_id, verified against the EMS,
+// retried up to 3 times, then escalated to a human. Reset needs two approvers.
+import { workflow, webhook, execTrigger, code, pgFn, ifNode, switchNode, cond, http, redisSet, execWf, setFields, noop, waitSeconds } from '../../tools/lib/dsl.mjs';
+
+const REQ = '$("Normalize request").first().json';
+
+export default workflow({
+  id: 'AQOS14KillSwitch',
+  name: 'AQOS-14 Kill switch',
+  active: true,
+  settings: { executionTimeout: 300 },
+  nodes: [
+    webhook('Ops kill webhook', { path: 'aqos/kill', auth: 'ops', respond: 'onReceived', note: 'POST { scope, scope_id, action, reason, requested_by, approver_ids? }' }),
+    execTrigger('Kill request (sub-workflow)'),
+    code('Normalize request', 'wf14-normalize-request.js'),
+    ifNode('Valid?', [cond('={{ $json.valid }}', 'boolean:true')]),
+    setFields('Reject notice', {
+      severity: 'SEV2',
+      text: { expr: '={{ "[KILL REJECTED] invalid or unauthorised request " + $("Normalize request").first().json.request_id }}' },
+    }, { keepOthers: false }),
+    switchNode('Reset or kill', [{ key: 'reset', conds: [cond('={{ $json.action }}', 'string:equals', 'reset')] }], { fallback: 'kill' }),
+    // ---- reset path (four-eyes)
+    code('Four-eyes check', 'wf14-four-eyes.js'),
+    ifNode('Two approvers?', [cond('={{ $json.four_eyes_ok }}', 'boolean:true')]),
+    pgFn('Apply reset', 'risk.apply_mode', {
+      payload: "{ scope: $json.scope, scope_id: $json.scope_id, mode: 'NORMAL', reason: 'reset:' + $json.reason, set_by: $json.requested_by, allow_deescalate: true, approver_ids: $json.approver_ids }",
+    }),
+    ifNode('Reset is global?', [cond(`={{ ${REQ}.scope }}`, 'string:equals', 'global')]),
+    redisSet('Mirror reset to flag', 'aqos:mode:global', '={{ $json.r.mode }}'),
+    setFields('Reset notice', {
+      severity: 'SEV2',
+      text: { expr: `={{ "[RESET] " + ${REQ}.scope + ":" + ${REQ}.scope_id + " -> " + $("Apply reset").first().json.r.mode + " approved by " + ${REQ}.approver_ids.join(" + ") }}` },
+    }, { keepOthers: false }),
+    // ---- kill path
+    pgFn('Record kill request', 'ops.record_kill_request', { payload: REQ }),
+    ifNode('Duplicate?', [cond('={{ $json.r.duplicate }}', 'boolean:true')]),
+    noop('Duplicate ignored', 'Same request_id already processed: nothing to do'),
+    pgFn('Set halt mode', 'risk.apply_mode', {
+      payload: `{ scope: ${REQ}.scope, scope_id: ${REQ}.scope_id, mode: 'HALT', reason: 'kill:' + ${REQ}.action + ':' + ${REQ}.reason, set_by: ${REQ}.requested_by }`,
+    }),
+    ifNode('Kill is global?', [cond(`={{ ${REQ}.scope }}`, 'string:equals', 'global')]),
+    redisSet('Mirror halt to flag', 'aqos:mode:global', '={{ $json.r.mode }}'),
+    http('Call EMS kill', {
+      method: 'POST', url: 'http://ems:8080/v1/kill', cred: 'emsAuth', timeoutMs: 15000, retries: 3, retryWaitMs: 1500, onError: 'continueRegularOutput',
+      body: `={{ JSON.stringify({ request_id: ${REQ}.request_id, scope: ${REQ}.scope, scope_id: ${REQ}.scope_id, action: ${REQ}.action, reason: ${REQ}.reason }) }}`,
+      note: 'Idempotent on request_id. The EMS also arms exchange-side cancel-all-after (dead-man switches).',
+    }),
+    http('Check EMS exposure', {
+      method: 'POST', url: 'http://ems:8080/v1/exposure', cred: 'emsAuth', timeoutMs: 15000, retries: 2, onError: 'continueRegularOutput',
+      body: `={{ JSON.stringify({ scope: ${REQ}.scope, scope_id: ${REQ}.scope_id }) }}`,
+    }),
+    code('Verify exposure', 'wf14-verify-exposure.js'),
+    ifNode('Clean?', [cond('={{ $json.clean }}', 'boolean:true')]),
+    code('Retry budget', 'wf14-retry-budget.js'),
+    ifNode('Retry?', [cond('={{ $json.retry }}', 'boolean:true')]),
+    waitSeconds('Backoff', 3),
+    pgFn('Complete request', 'ops.complete_kill_request', {
+      payload: "{ request_id: $json.request_id, status: $json.clean ? 'DONE' : 'FAILED', result: { clean: $json.clean, open_orders: $json.open_orders, residual_gross_usd: $json.residual_gross_usd } }",
+    }),
+    setFields('Kill report', {
+      severity: { expr: '={{ $("Verify exposure").first().json.clean ? "SEV2" : "SEV1" }}' },
+      text: { expr: '={{ $("Verify exposure").first().json.text + ($("Verify exposure").first().json.clean ? " - CONFIRMED" : " - NOT CONFIRMED, HUMAN ACTION REQUIRED") }}' },
+    }, { keepOthers: false }),
+    execWf('Notify', 'AQOS16Notifier00', { wait: false }),
+  ],
+  connections: [
+    ['Ops kill webhook', 'Normalize request'],
+    ['Kill request (sub-workflow)', 'Normalize request'],
+    ['Normalize request', 'Valid?'],
+    ['Valid?', 'Reject notice', { out: 'false' }],
+    ['Reject notice', 'Notify'],
+    ['Valid?', 'Reset or kill', { out: 'true' }],
+    ['Reset or kill', 'Four-eyes check', { out: 'reset' }],
+    ['Four-eyes check', 'Two approvers?'],
+    ['Two approvers?', 'Apply reset', { out: 'true' }],
+    ['Two approvers?', 'Reject notice', { out: 'false' }],
+    ['Apply reset', 'Reset is global?'],
+    ['Reset is global?', 'Mirror reset to flag', { out: 'true' }],
+    ['Mirror reset to flag', 'Reset notice'],
+    ['Reset is global?', 'Reset notice', { out: 'false' }],
+    ['Reset notice', 'Notify'],
+    ['Reset or kill', 'Record kill request', { out: 'kill' }],
+    ['Record kill request', 'Duplicate?'],
+    ['Duplicate?', 'Duplicate ignored', { out: 'true' }],
+    ['Duplicate?', 'Set halt mode', { out: 'false' }],
+    ['Set halt mode', 'Kill is global?'],
+    ['Kill is global?', 'Mirror halt to flag', { out: 'true' }],
+    ['Mirror halt to flag', 'Call EMS kill'],
+    ['Kill is global?', 'Call EMS kill', { out: 'false' }],
+    ['Call EMS kill', 'Check EMS exposure'],
+    ['Check EMS exposure', 'Verify exposure'],
+    ['Verify exposure', 'Clean?'],
+    ['Clean?', 'Complete request', { out: 'true' }],
+    ['Clean?', 'Retry budget', { out: 'false' }],
+    ['Retry budget', 'Retry?'],
+    ['Retry?', 'Backoff', { out: 'true' }],
+    ['Backoff', 'Call EMS kill'],
+    ['Retry?', 'Complete request', { out: 'false' }],
+    ['Complete request', 'Kill report'],
+    ['Kill report', 'Notify'],
+  ],
+});

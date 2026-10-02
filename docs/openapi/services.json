@@ -1,0 +1,575 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Custom service contracts: stream-gw, data-adapter, model-svc, portfolio-svc, risk-svc",
+    "version": "1.0.0",
+    "description": "The five internal services called by the n8n workflows. All calls are JSON over HTTP and must carry `Authorization: Bearer <token>` (n8n \"Header Auth\" credential); a request without a valid token gets HTTP 401. Errors are returned as `{ \"error\": { \"code\": \"...\", \"message\": \"...\" } }`. Each operation carries its own `servers` entry naming the owning service; the document-level `servers` list is the union of them."
+  },
+  "servers": [
+    { "url": "http://stream-gw:8080", "description": "stream-gw" },
+    { "url": "http://data-adapter:8080", "description": "data-adapter" },
+    { "url": "http://model-svc:8080", "description": "model-svc" },
+    { "url": "http://portfolio-svc:8080", "description": "portfolio-svc" },
+    { "url": "http://risk-svc:8080", "description": "risk-svc" }
+  ],
+  "security": [
+    { "bearerAuth": [] }
+  ],
+  "tags": [
+    { "name": "stream-gw", "description": "Market data gateway" },
+    { "name": "data-adapter", "description": "News and headline adapter" },
+    { "name": "model-svc", "description": "Forecast models" },
+    { "name": "portfolio-svc", "description": "Portfolio construction and allocation" },
+    { "name": "risk-svc", "description": "Risk snapshot" }
+  ],
+  "paths": {
+    "/v1/backfill": {
+      "post": {
+        "tags": ["stream-gw"],
+        "operationId": "postBackfill",
+        "summary": "Request a stream backfill",
+        "description": "Ask stream-gw to backfill `minutes` minutes of history for `feed_id`. Returns as soon as the job is queued.",
+        "servers": [{ "url": "http://stream-gw:8080" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/BackfillRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Backfill job accepted.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/BackfillResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "422": { "$ref": "#/components/responses/UnprocessableEntity" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      }
+    },
+    "/v1/headlines": {
+      "get": {
+        "tags": ["data-adapter"],
+        "operationId": "getHeadlines",
+        "summary": "Recent news headlines with symbol tags",
+        "description": "Return headlines published in the last `since` window (compact duration such as `15m`), each tagged with the symbols it mentions.",
+        "servers": [{ "url": "http://data-adapter:8080" }],
+        "parameters": [
+          {
+            "name": "since",
+            "in": "query",
+            "required": true,
+            "description": "Lookback window as a compact duration, e.g. `15m`.",
+            "schema": { "type": "string" },
+            "examples": { "fifteenMinutes": { "value": "15m" } }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Headlines in the requested window.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/HeadlinesResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "422": { "$ref": "#/components/responses/UnprocessableEntity" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      }
+    },
+    "/v1/predict": {
+      "post": {
+        "tags": ["model-svc"],
+        "operationId": "postPredict",
+        "summary": "Run the model set for one bar and return forecasts",
+        "description": "Run every model in `strategy_set` for `bar_ts`. Determinism rule: the response is a pure function of `(cycle_id, bar_ts, strategy_set)` and the pinned model versions, so re-posting the same `cycle_id` with the same `bar_ts` and `strategy_set` returns identical `as_of` and identical predictions, with no drift and no duplicate work. Invariants enforced per prediction: `as_of` equals the request `bar_ts`; `model_id` starts with one of `tsmom_v1`, `xsmom_v1`, `statarb_ou_v1`, `funding_carry_v1`, `basis_xex_v1`; `sigma > 0`; `abs(mu) <= 5 * sigma`; `0 <= p_up <= 1`.",
+        "servers": [{ "url": "http://model-svc:8080" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/PredictRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Forecasts for the requested bar.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PredictResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "422": { "$ref": "#/components/responses/UnprocessableEntity" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      }
+    },
+    "/v1/propose": {
+      "post": {
+        "tags": ["portfolio-svc"],
+        "operationId": "postPropose",
+        "summary": "Turn predictions into order proposals",
+        "description": "Size positions from the cycle's predictions and emit concrete order proposals per account and strategy. `diagnostics` carries sizing details such as target weights and clamp reasons.",
+        "servers": [{ "url": "http://portfolio-svc:8080" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ProposeRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Order proposals for this cycle.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ProposalsResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "422": { "$ref": "#/components/responses/UnprocessableEntity" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      }
+    },
+    "/v1/rebalance": {
+      "post": {
+        "tags": ["portfolio-svc"],
+        "operationId": "postRebalance",
+        "summary": "Rebalance drifted weights",
+        "description": "Given the accounts and their drifted venues/symbols, emit proposals that pull weights back inside `max_abs_drift`.",
+        "servers": [{ "url": "http://portfolio-svc:8080" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/RebalanceRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Rebalance proposals.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ProposalsResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "422": { "$ref": "#/components/responses/UnprocessableEntity" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      }
+    },
+    "/v1/allocation/propose": {
+      "post": {
+        "tags": ["portfolio-svc"],
+        "operationId": "postAllocationPropose",
+        "summary": "Propose strategy allocation weights",
+        "description": "Return proposed and current weights per strategy id for `as_of`, keyed by strategy.",
+        "servers": [{ "url": "http://portfolio-svc:8080" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/AllocationProposeRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Proposed and current allocation weights.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AllocationProposeResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "422": { "$ref": "#/components/responses/UnprocessableEntity" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      }
+    },
+    "/v1/snapshot": {
+      "get": {
+        "tags": ["risk-svc"],
+        "operationId": "getSnapshot",
+        "summary": "Read the full risk snapshot",
+        "description": "Global limits and VaR/ES, per-venue health and withdrawal state, and per-account equity, P&L and leverage limits. Read-only, no request body.",
+        "servers": [{ "url": "http://risk-svc:8080" }],
+        "responses": {
+          "200": {
+            "description": "Current risk snapshot.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/RiskSnapshot" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "422": { "$ref": "#/components/responses/UnprocessableEntity" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "n8n \"Header Auth\" credential: `Authorization: Bearer <token>`. A request without a valid token gets HTTP 401."
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "description": "Every 4xx/5xx response body.",
+        "properties": {
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": { "type": "string", "description": "Stable machine-readable error code." },
+              "message": { "type": "string", "description": "Human-readable explanation." }
+            },
+            "required": ["code", "message"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["error"],
+        "additionalProperties": false
+      },
+      "Side": {
+        "type": "string",
+        "description": "Order side.",
+        "enum": ["BUY", "SELL"]
+      },
+      "ModelId": {
+        "type": "string",
+        "description": "Model id; the id starts with one of `tsmom_v1`, `xsmom_v1`, `statarb_ou_v1`, `funding_carry_v1`, `basis_xex_v1`.",
+        "enum": [
+          "tsmom_v1",
+          "tsmom_v1+regime",
+          "xsmom_v1",
+          "xsmom_v1+regime",
+          "statarb_ou_v1",
+          "statarb_ou_v1+regime",
+          "funding_carry_v1",
+          "funding_carry_v1+regime",
+          "basis_xex_v1",
+          "basis_xex_v1+regime"
+        ]
+      },
+      "Diagnostics": {
+        "type": "object",
+        "description": "Free-form service diagnostics (weights, clamps, timings, warnings).",
+        "additionalProperties": true
+      },
+      "BackfillRequest": {
+        "type": "object",
+        "properties": {
+          "feed_id": { "type": "string", "description": "Feed to backfill." },
+          "minutes": { "type": "integer", "minimum": 1, "description": "How many minutes of history to fetch." }
+        },
+        "required": ["feed_id", "minutes"],
+        "additionalProperties": false
+      },
+      "BackfillResponse": {
+        "type": "object",
+        "properties": {
+          "accepted": { "type": "boolean", "const": true },
+          "job_id": { "type": "string", "description": "Id of the queued backfill job." }
+        },
+        "required": ["accepted", "job_id"],
+        "additionalProperties": false
+      },
+      "Headline": {
+        "type": "object",
+        "properties": {
+          "source": { "type": "string", "description": "Publisher or feed the headline came from." },
+          "title": { "type": "string" },
+          "url": { "type": "string", "format": "uri" },
+          "published_at": { "type": "string", "format": "date-time" },
+          "symbols": {
+            "type": "array",
+            "description": "Symbols mentioned in the headline.",
+            "items": { "type": "string" }
+          }
+        },
+        "required": ["source", "title", "url", "published_at", "symbols"],
+        "additionalProperties": false
+      },
+      "HeadlinesResponse": {
+        "type": "object",
+        "properties": {
+          "items": { "type": "array", "items": { "$ref": "#/components/schemas/Headline" } }
+        },
+        "required": ["items"],
+        "additionalProperties": false
+      },
+      "PredictRequest": {
+        "type": "object",
+        "properties": {
+          "cycle_id": {
+            "type": "string",
+            "description": "Cycle identifier; together with `bar_ts` and `strategy_set` it is the idempotency and determinism key for the prediction run."
+          },
+          "bar_ts": { "type": "string", "format": "date-time", "description": "Bar close time being predicted; echoed as `as_of`." },
+          "strategy_set": { "type": "string", "description": "Which model set to run." }
+        },
+        "required": ["cycle_id", "bar_ts", "strategy_set"],
+        "additionalProperties": false
+      },
+      "Prediction": {
+        "type": "object",
+        "description": "One model's forecast for one symbol and horizon. Invariants: `sigma > 0`, `abs(mu) <= 5 * sigma`, `0 <= p_up <= 1`.",
+        "properties": {
+          "model_id": { "$ref": "#/components/schemas/ModelId" },
+          "model_version": { "type": "string", "description": "Pinned version of the model code and weights." },
+          "symbol": { "type": "string" },
+          "horizon": { "type": "string", "description": "Forecast horizon, e.g. `5m`, `1h`." },
+          "mu": { "type": "number", "description": "Expected return; bounded by `abs(mu) <= 5 * sigma`." },
+          "sigma": { "type": "number", "exclusiveMinimum": 0, "description": "Forecast dispersion; strictly positive." },
+          "p_up": { "type": "number", "minimum": 0, "maximum": 1, "description": "Probability the move is up, in [0, 1]." },
+          "q05": { "type": "number", "description": "5% quantile." },
+          "q50": { "type": "number", "description": "Median quantile." },
+          "q95": { "type": "number", "description": "95% quantile." }
+        },
+        "required": ["model_id", "model_version", "symbol", "horizon", "mu", "sigma", "p_up", "q05", "q50", "q95"],
+        "additionalProperties": false
+      },
+      "PredictResponse": {
+        "type": "object",
+        "properties": {
+          "as_of": { "type": "string", "format": "date-time", "description": "Always equal to the request `bar_ts`." },
+          "regime": { "type": "string", "description": "Market regime label used for conditioning." },
+          "predictions": { "type": "array", "items": { "$ref": "#/components/schemas/Prediction" } },
+          "diagnostics": { "$ref": "#/components/schemas/Diagnostics" }
+        },
+        "required": ["as_of", "regime", "predictions", "diagnostics"],
+        "additionalProperties": false
+      },
+      "ProposeRequest": {
+        "type": "object",
+        "properties": {
+          "cycle_id": { "type": "string", "description": "Cycle this proposal belongs to." },
+          "bar_ts": { "type": "string", "format": "date-time" },
+          "predictions": { "type": "array", "items": { "$ref": "#/components/schemas/Prediction" } }
+        },
+        "required": ["cycle_id", "bar_ts", "predictions"],
+        "additionalProperties": false
+      },
+      "Proposal": {
+        "type": "object",
+        "description": "One proposed order, ready to be translated into an EMS `Order`.",
+        "properties": {
+          "account_id": { "type": "string" },
+          "strategy_id": { "type": "string" },
+          "symbol": { "type": "string" },
+          "venue": { "type": "string" },
+          "side": { "$ref": "#/components/schemas/Side" },
+          "qty": { "type": "number" },
+          "order_type": { "type": "string", "description": "e.g. LIMIT, MARKET." },
+          "limit_px": { "type": ["number", "null"], "description": "Limit price; null for market orders." },
+          "urgency": { "type": "string", "description": "Urgency hint, e.g. LOW, NORMAL, HIGH, URGENT." },
+          "pair_id": { "type": ["string", "null"], "description": "Pairs the two legs of a hedge; null when unpaired." },
+          "reduce_only": { "type": "boolean" }
+        },
+        "required": [
+          "account_id",
+          "strategy_id",
+          "symbol",
+          "venue",
+          "side",
+          "qty",
+          "order_type",
+          "limit_px",
+          "urgency",
+          "pair_id",
+          "reduce_only"
+        ],
+        "additionalProperties": false
+      },
+      "ProposalsResponse": {
+        "type": "object",
+        "properties": {
+          "proposals": { "type": "array", "items": { "$ref": "#/components/schemas/Proposal" } },
+          "diagnostics": { "$ref": "#/components/schemas/Diagnostics" }
+        },
+        "required": ["proposals"],
+        "additionalProperties": false
+      },
+      "RebalanceDrift": {
+        "type": "object",
+        "description": "One venue/symbol whose weight has drifted.",
+        "properties": {
+          "venue": { "type": "string" },
+          "symbol": { "type": "string" },
+          "target_w": { "type": "number", "description": "Target weight." },
+          "current_w": { "type": "number", "description": "Current weight." }
+        },
+        "required": ["venue", "symbol", "target_w", "current_w"],
+        "additionalProperties": false
+      },
+      "RebalanceAccount": {
+        "type": "object",
+        "properties": {
+          "account_id": { "type": "string" },
+          "max_abs_drift": { "type": "number", "minimum": 0, "description": "Largest tolerated absolute drift before a rebalance order is proposed." },
+          "drifted": { "type": "array", "items": { "$ref": "#/components/schemas/RebalanceDrift" } }
+        },
+        "required": ["account_id", "max_abs_drift", "drifted"],
+        "additionalProperties": false
+      },
+      "RebalanceRequest": {
+        "type": "object",
+        "properties": {
+          "as_of": { "type": "string", "format": "date-time", "description": "Time the drift was measured at." },
+          "reason": { "type": "string", "description": "Why the rebalance was triggered." },
+          "accounts": { "type": "array", "items": { "$ref": "#/components/schemas/RebalanceAccount" } }
+        },
+        "required": ["as_of", "reason", "accounts"],
+        "additionalProperties": false
+      },
+      "AllocationProposeRequest": {
+        "type": "object",
+        "properties": {
+          "as_of": { "type": "string", "format": "date-time" }
+        },
+        "required": ["as_of"],
+        "additionalProperties": false
+      },
+      "AllocationProposeResponse": {
+        "type": "object",
+        "properties": {
+          "proposed_weights": {
+            "type": "object",
+            "description": "Proposed weight per strategy id.",
+            "additionalProperties": { "type": "number" }
+          },
+          "current_weights": {
+            "type": "object",
+            "description": "Current weight per strategy id.",
+            "additionalProperties": { "type": "number" }
+          },
+          "diagnostics": { "$ref": "#/components/schemas/Diagnostics" }
+        },
+        "required": ["proposed_weights", "current_weights"],
+        "additionalProperties": false
+      },
+      "RiskSnapshot": {
+        "type": "object",
+        "properties": {
+          "source": { "type": "string", "const": "risk_svc" },
+          "ts": { "type": "string", "format": "date-time", "description": "Time the snapshot was taken." },
+          "global": { "$ref": "#/components/schemas/RiskGlobal" },
+          "venues": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/RiskVenue" }
+          },
+          "accounts": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/RiskAccount" }
+          }
+        },
+        "required": ["source", "ts", "global", "venues", "accounts"],
+        "additionalProperties": false
+      },
+      "RiskGlobal": {
+        "type": "object",
+        "description": "Portfolio-level limits and measurements.",
+        "properties": {
+          "var_limit_usd": { "type": "number" },
+          "var_99_1d_usd": { "type": "number", "description": "Current 99% 1-day VaR." },
+          "es_limit_usd": { "type": "number" },
+          "es_975_1d_usd": { "type": "number", "description": "Current 97.5% 1-day expected shortfall." },
+          "absorption_ratio": { "type": "number" },
+          "stablecoin_depeg_bps": {
+            "type": "object",
+            "description": "Depeg in basis points per stablecoin, e.g. `{\"USDT\": 4}`.",
+            "additionalProperties": { "type": "number" }
+          },
+          "max_mark_age_s": { "type": "number", "description": "Maximum tolerated age of a mark price, in seconds." }
+        },
+        "required": [
+          "var_limit_usd",
+          "var_99_1d_usd",
+          "es_limit_usd",
+          "es_975_1d_usd",
+          "absorption_ratio",
+          "stablecoin_depeg_bps",
+          "max_mark_age_s"
+        ],
+        "additionalProperties": false
+      },
+      "RiskVenue": {
+        "type": "object",
+        "description": "Health and withdrawal state of one venue.",
+        "properties": {
+          "venue": { "type": "string" },
+          "health": { "type": "string", "enum": ["UP", "DOWN"] },
+          "withdrawals_suspended": { "type": "boolean" }
+        },
+        "required": ["venue", "health", "withdrawals_suspended"],
+        "additionalProperties": false
+      },
+      "RiskAccount": {
+        "type": "object",
+        "description": "Equity, P&L and hard limits of one account.",
+        "properties": {
+          "account_id": { "type": "string" },
+          "equity_usd": { "type": "number" },
+          "day_pnl_pct": { "type": "number", "description": "Day P&L as a percentage of equity." },
+          "drawdown_pct": { "type": "number", "description": "Current drawdown percentage." },
+          "gross_leverage": { "type": "number" },
+          "daily_loss_limit_pct": { "type": "number", "description": "Loss that flattens the account for the day, in percent." },
+          "max_drawdown_pct": { "type": "number", "description": "Hard drawdown limit in percent." },
+          "auto_flatten_on_max_dd": { "type": "boolean", "description": "Whether reaching `max_drawdown_pct` triggers an automatic flatten." },
+          "min_liq_distance_sigma": { "type": "number", "description": "Minimum liquidation distance, in standard deviations." }
+        },
+        "required": [
+          "account_id",
+          "equity_usd",
+          "day_pnl_pct",
+          "drawdown_pct",
+          "gross_leverage",
+          "daily_loss_limit_pct",
+          "max_drawdown_pct",
+          "auto_flatten_on_max_dd",
+          "min_liq_distance_sigma"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "responses": {
+      "Unauthorized": {
+        "description": "Missing or invalid bearer token.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "UnprocessableEntity": {
+        "description": "Body parsed but semantically invalid (bad enum, violated prediction invariant, unknown strategy set).",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "ServiceUnavailable": {
+        "description": "A downstream dependency is unavailable; retry with backoff.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      }
+    }
+  }
+}

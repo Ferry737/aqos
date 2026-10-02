@@ -1,0 +1,396 @@
+{
+  "id": "AQOS11Billing000",
+  "name": "AQOS-11 Billing sync",
+  "active": true,
+  "nodes": [
+    {
+      "id": "bcbad634-f30c-4055-88ca-a6e76811a167",
+      "name": "Stripe events",
+      "type": "n8n-nodes-base.stripeTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "events": [
+          "invoice.paid",
+          "invoice.payment_failed",
+          "customer.subscription.created",
+          "customer.subscription.updated",
+          "customer.subscription.deleted",
+          "checkout.session.completed"
+        ]
+      },
+      "credentials": {
+        "stripeApi": {
+          "id": "aqosCredStripe000",
+          "name": "AQOS Stripe"
+        }
+      }
+    },
+    {
+      "id": "a394c561-7b52-4ca7-8afd-fe90ca84102e",
+      "name": "Normalize Stripe event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        280,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Stripe event -> the shape biz.apply_billing_event expects.\nconst e = $input.first().json;\nconst o = e.data?.object ?? {};\nconst price = o.items?.data?.[0]?.price ?? o.lines?.data?.[0]?.price ?? null;\nconst monthly = price?.recurring?.interval === 'month' && price?.currency === 'usd' ? Number(price.unit_amount) / 100 : null;\nreturn [{\n  json: {\n    event_id: e.id,\n    type: e.type,\n    customer_id: o.customer ?? null,\n    subscription_id: o.object === 'subscription' ? o.id : o.subscription ?? null,\n    subscription_status: o.object === 'subscription' ? o.status : null,\n    client_ref: o.client_reference_id ?? o.metadata?.client_ref ?? null,\n    tier: price?.lookup_key ?? o.metadata?.tier ?? null,\n    monthly_fee_usd: monthly,\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "d1e8b78a-2dcc-4411-87e5-f150e724ee2a",
+      "name": "Apply billing event",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        560,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT biz.apply_billing_event($1::jsonb) AS r",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify($json) }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "aqosCredPgMain00",
+          "name": "AQOS Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "b218f158-1e32-4443-8779-5197ed4269d5",
+      "name": "Client matched?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        840,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "40aae76d-72c2-4a7d-8a2e-64550836d3fb",
+              "leftValue": "={{ $json.r.client_id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            },
+            {
+              "id": "1c1be32b-8661-4128-8ca6-a5755ba1acdc",
+              "leftValue": "={{ $json.r.duplicate }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "2c201420-f0b9-4544-8e70-ccb3692f8a6a",
+      "name": "Client email",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1120,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT email FROM biz.clients WHERE client_id = $1::uuid",
+        "options": {
+          "queryReplacement": "={{ $json.r.client_id }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "aqosCredPgMain00",
+          "name": "AQOS Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "ae59a9f1-2bd6-48fb-8747-6aee886d604c",
+      "name": "Billing message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1400,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Client-facing billing notices. A lapsed subscription never liquidates:\n// accounts move to reduce-only and the client keeps full control.\nconst r = $('Apply billing event').first().json.r ?? {};\nif (r.duplicate || r.unmatched || r.ignored || !r.client_id) return [];\nconst email = $input.first().json.email;\nconst copy = {\n  PAST_DUE: {\n    subject: 'Payment failed: your AQOS subscription',\n    text: 'We could not collect your subscription payment. Nothing changes for 7 days. After that, automation for your connected accounts switches to reduce-only: no new positions are opened and existing positions are not liquidated. Update your payment method in the dashboard to avoid this.',\n  },\n  PAUSED_BILLING: {\n    subject: 'Automation paused to reduce-only',\n    text: 'Your subscription is paused, so automation for your connected accounts is now reduce-only. We have not closed any positions. You can manage positions directly on your exchange at any time, or resume the subscription in the dashboard.',\n  },\n  CANCELED: {\n    subject: 'Your AQOS subscription has ended',\n    text: 'Your subscription has ended. Automation is reduce-only and we have not closed any positions. Your exchange account and funds remain under your control. You can export your full trade and audit history from the dashboard for 90 days.',\n  },\n  ACTIVE: {\n    subject: 'Your AQOS subscription is active',\n    text: 'Your subscription is active. If automation was paused for billing, it has returned to the mode you configured.',\n  },\n}[r.status];\nif (!copy || !email) return [];\nreturn [{ json: { to: email, subject: copy.subject, text: `${copy.text}\\n\\nThis is a service notice from AQOS, a software platform. It is not investment advice.` } }];\n"
+      }
+    },
+    {
+      "id": "fbb5c7fa-da02-4963-84f7-d8703b5fdbad",
+      "name": "Send billing notice",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1680,
+        0
+      ],
+      "parameters": {
+        "fromEmail": "AQOS <no-reply@example.com>",
+        "toEmail": "={{ $json.to }}",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "html",
+        "html": "={{ \"<p>\" + $json.text.replace(/\\n/g, \"<br>\") + \"</p>\" }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "credentials": {
+        "smtp": {
+          "id": "aqosCredSmtp00000",
+          "name": "AQOS SMTP"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "id": "e729b5fa-2e5a-4701-8395-bdd0dccb038f",
+      "name": "Weekly fee check (Mon 08:00 UTC)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        0,
+        150
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 0 8 * * 1"
+            }
+          ]
+        },
+        "misfirePolicy": "coalesce_owner",
+        "misfireGraceSeconds": 21600
+      }
+    },
+    {
+      "id": "c009b958-160d-4df6-832c-d97631173c18",
+      "name": "Fee burden report",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        280,
+        150
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM biz.fee_burden_report($1::jsonb)",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ threshold_annual_pct: 2 }) }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "aqosCredPgMain00",
+          "name": "AQOS Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "30985fc7-5995-43a7-8d4f-364f6cb7563b",
+      "name": "Fee burden message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        560,
+        150
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Client-protective guardrail: if the subscription costs more than 2% a year\n// of the capital connected, tell the client and suggest cheaper options.\nreturn $input.all().map(({ json: r }) => ({\n  json: {\n    to: r.email,\n    subject: 'Your plan may cost more than it should',\n    text: [\n      `Your plan costs about ${Number(r.annual_fee_pct).toFixed(2)}% a year of the capital you have connected `\n        + `(USD ${Number(r.monthly_fee_usd).toFixed(2)} a month against about USD ${Math.round(Number(r.connected_equity_usd)).toLocaleString('en-US')}).`,\n      'At that ratio, fees can absorb a large share of any gains. Consider a smaller plan, or paper mode until you connect more capital.',\n      'You can change or pause your plan at any time in the dashboard; pausing is prorated.',\n      '',\n      'This is a service notice from AQOS, a software platform. It is not investment advice.',\n    ].join('\\n'),\n  },\n}));\n"
+      }
+    },
+    {
+      "id": "d659a415-cd29-487f-867b-300534d0497c",
+      "name": "Send fee notice",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        840,
+        150
+      ],
+      "parameters": {
+        "fromEmail": "AQOS <no-reply@example.com>",
+        "toEmail": "={{ $json.to }}",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "html",
+        "html": "={{ \"<p>\" + $json.text.replace(/\\n/g, \"<br>\") + \"</p>\" }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "credentials": {
+        "smtp": {
+          "id": "aqosCredSmtp00000",
+          "name": "AQOS SMTP"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    }
+  ],
+  "connections": {
+    "Stripe events": {
+      "main": [
+        [
+          {
+            "node": "Normalize Stripe event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Stripe event": {
+      "main": [
+        [
+          {
+            "node": "Apply billing event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply billing event": {
+      "main": [
+        [
+          {
+            "node": "Client matched?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Client matched?": {
+      "main": [
+        [
+          {
+            "node": "Client email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Client email": {
+      "main": [
+        [
+          {
+            "node": "Billing message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Billing message": {
+      "main": [
+        [
+          {
+            "node": "Send billing notice",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Weekly fee check (Mon 08:00 UTC)": {
+      "main": [
+        [
+          {
+            "node": "Fee burden report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fee burden report": {
+      "main": [
+        [
+          {
+            "node": "Fee burden message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fee burden message": {
+      "main": [
+        [
+          {
+            "node": "Send fee notice",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "UTC",
+    "saveDataErrorExecution": "all",
+    "saveManualExecutions": false,
+    "errorWorkflow": "AQOS13ErrorHandl",
+    "executionTimeout": 60
+  },
+  "pinData": {},
+  "tags": [
+    {
+      "name": "aqos"
+    }
+  ],
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}

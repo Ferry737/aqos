@@ -1,0 +1,19 @@
+{
+  "name": "aqos",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AQOS (Agentic Quant OS): n8n control plane, Postgres invariants, and verification tooling for a 24/7 crypto trading operating system.",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "node tools/build-workflows.mjs",
+    "validate": "node tools/validate-workflows.mjs",
+    "test:db": "node tools/test-schema.mjs",
+    "test:validator": "node --test tools/tests/validator.test.mjs",
+    "test:logic": "node --test \"tools/tests/*.test.mjs\"",
+    "credentials": "node tools/make-credentials-template.mjs",
+    "catalog:snapshot": "node tools/snapshot-catalog.mjs",
+    "verify": "npm run build && npm run validate && npm run test:db && npm run test:logic"
+  },
+  "devDependencies": { "@electric-sql/pglite": "^0.5.8" }
+}

@@ -1,0 +1,834 @@
+{
+  "id": "AQOS08PortfolioA",
+  "name": "AQOS-08 Portfolio agent",
+  "active": true,
+  "nodes": [
+    {
+      "id": "4f74fecd-a82f-494b-8015-e2378dfe0106",
+      "name": "Hourly drift check",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 5 * * * *"
+            }
+          ]
+        },
+        "misfirePolicy": "skip",
+        "misfireGraceSeconds": 0
+      }
+    },
+    {
+      "id": "ad8700ae-9d1a-44a4-8c86-7509814a0585",
+      "name": "Drift report",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        280,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM pm.drift_report($1::jsonb)",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({}) }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "aqosCredPgMain00",
+          "name": "AQOS Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "36c2ed6a-14e6-419f-8b15-ad21f7cfd341",
+      "name": "Rebalance request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        560,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Accounts whose weights drifted outside their no-trade band this hour.\nconst rows = $input.all().map((i) => i.json).filter((r) => r.account_id);\nreturn [{\n  json: {\n    as_of: new Date().toISOString(),\n    reason: 'drift',\n    accounts: rows.map((r) => ({ account_id: r.account_id, max_abs_drift: Number(r.max_abs_drift), drifted: r.drifted ?? [] })),\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "0d1e4c2f-1767-4ca6-87c8-b7a992798ea2",
+      "name": "Request rebalance",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        840,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://portfolio-svc:8080/v1/rebalance",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "aqosCredPortSvc00",
+          "name": "AQOS Portfolio Service Token"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "2788e957-b9cf-40b8-879b-c3428c8830ed",
+      "name": "Prepare rebalance proposals",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Rebalance proposals with deterministic ids per hour bucket (a retried run\n// in the same hour cannot double-trade), shuffled for fair dispatch.\nconst hour = new Date(Math.floor(Date.now() / 3_600_000) * 3_600_000).toISOString();\nconst raw = Array.isArray($input.first().json.proposals) ? $input.first().json.proposals : [];\nconst props = raw\n  .map((p) => ({ ...p, side: String(p?.side ?? '').toUpperCase(), qty: Number(p?.qty) }))\n  .filter((p) => p.account_id && p.strategy_id && p.symbol && p.venue && (p.side === 'BUY' || p.side === 'SELL') && p.qty > 0)\n  .map((p) => ({\n    proposal_id: `rebal:${hour}:${p.account_id}:${p.strategy_id}:${p.venue}:${p.symbol}:${p.side}`,\n    cycle_id: null,\n    account_id: p.account_id,\n    strategy_id: p.strategy_id,\n    symbol: p.symbol,\n    venue: p.venue,\n    side: p.side,\n    qty: p.qty,\n    order_type: p.order_type ?? 'LIMIT',\n    limit_px: p.limit_px ?? null,\n    urgency: p.urgency ?? 'low',\n    pair_id: p.pair_id ?? null,\n    source: 'rebalance',\n  }));\nfor (let i = props.length - 1; i > 0; i--) {\n  const j = Math.floor(Math.random() * (i + 1));\n  [props[i], props[j]] = [props[j], props[i]];\n}\nreturn props.map((p) => ({ json: p }));\n"
+      }
+    },
+    {
+      "id": "996c30d6-d9ba-45d5-8141-c697f1182680",
+      "name": "Risk gate (rebalance)",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.4,
+      "position": [
+        1400,
+        0
+      ],
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "AQOS04RiskGate00",
+          "mode": "id"
+        },
+        "mode": "once",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    },
+    {
+      "id": "98aa58ac-6963-44f0-8e9e-4439c1ebcb24",
+      "name": "Daily meta-learner 06:10 UTC",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        0,
+        150
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 10 6 * * *"
+            }
+          ]
+        },
+        "misfirePolicy": "coalesce_owner",
+        "misfireGraceSeconds": 7200
+      }
+    },
+    {
+      "id": "f1ba9611-a1e3-4d3e-81e4-57500ab0b974",
+      "name": "Request allocation",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        280,
+        150
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://portfolio-svc:8080/v1/allocation/propose",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ { as_of: $now.toISO() } }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "aqosCredPortSvc00",
+          "name": "AQOS Portfolio Service Token"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput",
+      "notes": "Custom meta-learner (online / bandit allocation over strategy sleeves).",
+      "notesInFlow": false
+    },
+    {
+      "id": "a8efa982-0e50-4d4f-8ed3-4d491ad3066f",
+      "name": "Bounded-change policy",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        560,
+        150
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Bounded autonomy for the meta-learner: each strategy weight may move at\n// most 5 percentage points per day and one-way turnover may not exceed 15%.\n// Anything outside the envelope is staged for a human.\nconst MAX_STEP = 0.05;\nconst MAX_TURNOVER = 0.15;\nconst r = $input.first().json;\nconst prop = r.proposed_weights ?? {};\nconst cur = r.current_weights ?? {};\nconst keys = [...new Set([...Object.keys(prop), ...Object.keys(cur)])].sort();\nconst deltas = keys.map((k) => {\n  const from = Number(cur[k] ?? 0);\n  const to = Number(prop[k] ?? 0);\n  return { strategy: k, from, to, delta: to - from };\n});\nconst sum = Object.values(prop).reduce((a, b) => a + Number(b), 0);\nconst turnover = deltas.reduce((a, d) => a + Math.abs(d.delta), 0) / 2;\nconst violations = [];\nif (!Object.keys(prop).length) violations.push('empty_proposal');\nif (Math.abs(sum - 1) > 1e-6) violations.push(`weights_sum_${sum.toFixed(6)}`);\nif (Object.values(prop).some((w) => !(Number(w) >= 0))) violations.push('negative_or_invalid_weight');\nfor (const d of deltas) if (Math.abs(d.delta) > MAX_STEP + 1e-12) violations.push(`step_${d.strategy}_${d.delta.toFixed(4)}`);\nif (turnover > MAX_TURNOVER + 1e-12) violations.push(`turnover_${turnover.toFixed(4)}`);\nreturn [{\n  json: {\n    proposed_weights: prop, current_weights: cur, deltas, turnover,\n    within_bounds: violations.length === 0, violations, diagnostics: r.diagnostics ?? null,\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "05dc764d-c5fb-4e1e-88b5-377719b6d02b",
+      "name": "Build review request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        840,
+        150
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// --- shared: Claude Messages API helpers (inlined at build time) -----------\n// One model for every LLM route; effort is tuned per route. Structured outputs\n// (output_config.format) guarantee schema-valid JSON. Server-side fallbacks\n// re-run a declined request on Anthropic's recommended fallback model.\n// Any refusal, truncation, HTTP error or bad JSON returns ok=false so the\n// caller takes its deterministic path: no LLM sits on a path that moves money.\nconst CLAUDE_MODEL = 'claude-opus-5-5';\nfunction claudeRequest({ system, user, schema, effort = 'low', maxTokens = 8000 }) {\n  return {\n    model: CLAUDE_MODEL,\n    max_tokens: maxTokens,\n    fallbacks: 'default',\n    system,\n    output_config: { effort, format: { type: 'json_schema', schema } },\n    messages: [{ role: 'user', content: typeof user === 'string' ? user : JSON.stringify(user) }],\n  };\n}\nfunction parseClaude(item) {\n  if (!item) return { ok: false, reason: 'no_response' };\n  if (item.error) return { ok: false, reason: 'http_error', detail: String(item.error.message ?? item.error).slice(0, 300) };\n  const status = item.statusCode;\n  const msg = item.body ?? item;\n  if (status && (status < 200 || status >= 300)) return { ok: false, reason: `http_${status}`, detail: msg?.error?.type ?? null };\n  if (msg?.stop_reason === 'refusal') return { ok: false, reason: 'refusal', detail: msg.stop_details?.category ?? null };\n  if (msg?.stop_reason === 'max_tokens') return { ok: false, reason: 'max_tokens' };\n  const text = (msg?.content ?? []).filter((b) => b.type === 'text').map((b) => b.text).join('');\n  try {\n    return { ok: true, data: JSON.parse(text), model: msg.model ?? CLAUDE_MODEL, usage: msg.usage ?? null };\n  } catch {\n    return { ok: false, reason: 'invalid_json' };\n  }\n}\n// --- end shared --------------------------------------------------------------\n\n// Portfolio agent review. It can recommend human review (adding caution)\n// but cannot approve anything or widen the envelope.\nconst schema = {\n  type: 'object',\n  additionalProperties: false,\n  required: ['summary', 'concerns', 'recommend_human_review'],\n  properties: {\n    summary: { type: 'string' },\n    concerns: { type: 'array', items: { type: 'string' } },\n    recommend_human_review: { type: 'boolean' },\n  },\n};\nconst system = [\n  'You review a proposed daily change to strategy capital weights for a systematic crypto portfolio.',\n  'The change was produced by an online meta-learner and already passed or failed a bounded-change policy.',\n  'Explain the change in plain language for the audit log (at most four sentences), list concrete concerns',\n  '(concentration, regime fit, crowding, data quality, correlation), and set recommend_human_review to true',\n  'if anything warrants a human look. You cannot approve changes. Use only the numbers provided.',\n].join(' ');\nconst b = $input.first().json;\nreturn [{ json: { anthropic_request: claudeRequest({ system, user: b, schema, effort: 'medium', maxTokens: 6000 }) } }];\n"
+      }
+    },
+    {
+      "id": "ee6d9ae7-6f40-4450-811f-2b5a975cc40c",
+      "name": "Claude review",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1120,
+        150
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "anthropicApi",
+        "sendHeaders": true,
+        "specifyHeaders": "keypair",
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "anthropic-beta",
+              "value": "server-side-fallback-2026-07-01"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.anthropic_request) }}",
+        "options": {
+          "timeout": 120000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "anthropicApi": {
+          "id": "aqosCredAnthrop00",
+          "name": "AQOS Anthropic"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "530b34e5-5d7e-42cc-87b8-f002d95f5d44",
+      "name": "Decide path",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1400,
+        150
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// --- shared: Claude Messages API helpers (inlined at build time) -----------\n// One model for every LLM route; effort is tuned per route. Structured outputs\n// (output_config.format) guarantee schema-valid JSON. Server-side fallbacks\n// re-run a declined request on Anthropic's recommended fallback model.\n// Any refusal, truncation, HTTP error or bad JSON returns ok=false so the\n// caller takes its deterministic path: no LLM sits on a path that moves money.\nconst CLAUDE_MODEL = 'claude-opus-5-5';\nfunction claudeRequest({ system, user, schema, effort = 'low', maxTokens = 8000 }) {\n  return {\n    model: CLAUDE_MODEL,\n    max_tokens: maxTokens,\n    fallbacks: 'default',\n    system,\n    output_config: { effort, format: { type: 'json_schema', schema } },\n    messages: [{ role: 'user', content: typeof user === 'string' ? user : JSON.stringify(user) }],\n  };\n}\nfunction parseClaude(item) {\n  if (!item) return { ok: false, reason: 'no_response' };\n  if (item.error) return { ok: false, reason: 'http_error', detail: String(item.error.message ?? item.error).slice(0, 300) };\n  const status = item.statusCode;\n  const msg = item.body ?? item;\n  if (status && (status < 200 || status >= 300)) return { ok: false, reason: `http_${status}`, detail: msg?.error?.type ?? null };\n  if (msg?.stop_reason === 'refusal') return { ok: false, reason: 'refusal', detail: msg.stop_details?.category ?? null };\n  if (msg?.stop_reason === 'max_tokens') return { ok: false, reason: 'max_tokens' };\n  const text = (msg?.content ?? []).filter((b) => b.type === 'text').map((b) => b.text).join('');\n  try {\n    return { ok: true, data: JSON.parse(text), model: msg.model ?? CLAUDE_MODEL, usage: msg.usage ?? null };\n  } catch {\n    return { ok: false, reason: 'invalid_json' };\n  }\n}\n// --- end shared --------------------------------------------------------------\n\n// apply: inside the envelope and the agent saw no reason for review.\n// stage: everything else. The agent can add caution, never remove it; if the\n// review is unavailable the bounded-change policy alone decides.\nconst b = $('Bounded-change policy').first().json;\nconst t = parseClaude($input.first().json);\nconst review = t.ok ? t.data : null;\nconst auto = b.within_bounds === true && review?.recommend_human_review !== true;\nreturn [{\n  json: {\n    ...b,\n    review,\n    review_error: t.ok ? null : t.reason,\n    path: auto ? 'apply' : 'stage',\n    rationale: review?.summary ?? `bounded-change policy: ${b.within_bounds ? 'within envelope' : b.violations.join(', ')}`,\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "2c637e2b-0e82-4ef6-8e03-1409cd6c3d5e",
+      "name": "Auto-apply?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1680,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "1d6c2d76-7c93-4f2f-80f3-605882cd7b33",
+              "leftValue": "={{ $json.path }}",
+              "rightValue": "apply",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "38fd2ac6-40be-477a-8da8-5aaf8a5d309b",
+      "name": "Apply allocation",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1960,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT pm.apply_allocation($1::jsonb) AS r",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ weights: $json.proposed_weights, proposed_by: 'meta_learner', rationale: $json.rationale }) }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "aqosCredPgMain00",
+          "name": "AQOS Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "5dabb5bb-5b65-43ce-8bf4-0329239a42d2",
+      "name": "Allocation applied notice",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.5,
+      "position": [
+        2240,
+        0
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "",
+              "name": "severity",
+              "value": "INFO",
+              "type": "string"
+            },
+            {
+              "id": "",
+              "name": "text",
+              "value": "={{ \"[ALLOCATION] v\" + $json.r.version_id + \" applied automatically (within bounds): \" + $(\"Decide path\").first().json.deltas.filter(d => Math.abs(d.delta) > 1e-9).map(d => d.strategy + \" \" + (d.delta * 100).toFixed(1) + \"pp\").join(\", \") }}",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": false,
+        "options": {}
+      }
+    },
+    {
+      "id": "48f480ca-fc22-4e9e-83ac-3728000de0f2",
+      "name": "Approval token",
+      "type": "n8n-nodes-base.crypto",
+      "typeVersion": 2,
+      "position": [
+        1960,
+        150
+      ],
+      "parameters": {
+        "action": "generate",
+        "dataPropertyName": "token",
+        "encodingType": "hex",
+        "stringLength": 64
+      }
+    },
+    {
+      "id": "90057cfb-9ea5-4136-8ed2-1f54db545768",
+      "name": "Stage allocation",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        2240,
+        150
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT pm.stage_allocation($1::jsonb) AS r",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ weights: $('Decide path').first().json.proposed_weights, token: $('Approval token').first().json.token, proposed_by: 'meta_learner', rationale: $('Decide path').first().json.rationale, ttl_s: 14400 }) }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "aqosCredPgMain00",
+          "name": "AQOS Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "76ddd3e0-e431-452a-865d-4ff8e0c254ca",
+      "name": "Build approval message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2520,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Approval request with one-time links to this execution's Wait node.\n// The token is single-use and expires with the staged allocation (4 h).\n// The ops chat must be restricted to authorised risk approvers.\nconst staged = $('Stage allocation').first().json.r;\nconst d = $('Decide path').first().json;\nconst token = $('Approval token').first().json.token;\nconst link = (decision) => `${$execution.resumeUrl}?decision=${decision}&v=${staged.version_id}&token=${token}&approver=YOUR_ID`;\nconst moves = d.deltas\n  .filter((x) => Math.abs(x.delta) > 1e-9)\n  .map((x) => `${x.strategy}: ${(x.from * 100).toFixed(1)}% -> ${(x.to * 100).toFixed(1)}%`);\nconst why = d.violations.length ? d.violations.join(', ') : 'portfolio agent requested human review';\nreturn [{\n  json: {\n    version_id: staged.version_id,\n    text: [\n      `[APPROVAL] Strategy allocation v${staged.version_id} (expires in 4 h)`,\n      ...moves,\n      `Why staged: ${why}`,\n      `Agent notes: ${d.review?.summary ?? 'n/a'}`,\n      `Approve: ${link('approve')}`,\n      `Reject: ${link('reject')}`,\n    ].join('\\n'),\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "a10c547b-e4a7-4af2-8e73-1c2d28d3cb37",
+      "name": "Send approval request",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.4,
+      "position": [
+        2800,
+        0
+      ],
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "AQOS16Notifier00",
+          "mode": "id"
+        },
+        "mode": "once",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    },
+    {
+      "id": "00c5146e-963b-4e0e-8165-0b7d52adba78",
+      "name": "Wait for approval",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        3080,
+        0
+      ],
+      "parameters": {
+        "resume": "webhook",
+        "httpMethod": "GET",
+        "responseMode": "onReceived",
+        "limitWaitTime": true,
+        "limitType": "afterTimeInterval",
+        "resumeAmount": 4,
+        "resumeUnit": "hours"
+      }
+    },
+    {
+      "id": "fe064d05-eac1-4483-8cd4-b3d16c619139",
+      "name": "Approval result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3360,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Reads the approver's click (query string) or the Wait timeout. A timeout\n// is recorded as a rejection; the current allocation stays in force.\nconst q = $input.first().json.query ?? {};\nconst msg = $('Build approval message').first().json;\nconst timedOut = !q.decision;\nreturn [{\n  json: {\n    version_id: msg.version_id,\n    token: timedOut ? $('Approval token').first().json.token : String(q.token ?? ''),\n    decision: timedOut ? 'timeout' : String(q.decision).toLowerCase(),\n    approver: timedOut ? 'timeout' : String(q.approver ?? 'unknown').slice(0, 80),\n    timed_out: timedOut,\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "679a889e-d95d-4b23-8505-5f88670a8b32",
+      "name": "Verify approval",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        3640,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT pm.verify_approval($1::jsonb) AS r",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify($json) }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "aqosCredPgMain00",
+          "name": "AQOS Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "4192db10-4044-4d9b-8198-546c5f01fac7",
+      "name": "Approval outcome notice",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.5,
+      "position": [
+        3920,
+        0
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "",
+              "name": "severity",
+              "value": "INFO",
+              "type": "string"
+            },
+            {
+              "id": "",
+              "name": "text",
+              "value": "={{ \"[ALLOCATION] v\" + $(\"Approval result\").first().json.version_id + \": \" + ($json.r.approved ? \"approved by \" + $(\"Approval result\").first().json.approver + \" and applied\" : \"not applied (\" + $json.r.reason + \")\") }}",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": false,
+        "options": {}
+      }
+    },
+    {
+      "id": "ff23f73a-1f7d-4d22-8a6e-fc10ffa67277",
+      "name": "Notify",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.4,
+      "position": [
+        4200,
+        0
+      ],
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "AQOS16Notifier00",
+          "mode": "id"
+        },
+        "mode": "once",
+        "options": {
+          "waitForSubWorkflow": false
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Hourly drift check": {
+      "main": [
+        [
+          {
+            "node": "Drift report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Drift report": {
+      "main": [
+        [
+          {
+            "node": "Rebalance request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rebalance request": {
+      "main": [
+        [
+          {
+            "node": "Request rebalance",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Request rebalance": {
+      "main": [
+        [
+          {
+            "node": "Prepare rebalance proposals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare rebalance proposals": {
+      "main": [
+        [
+          {
+            "node": "Risk gate (rebalance)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Daily meta-learner 06:10 UTC": {
+      "main": [
+        [
+          {
+            "node": "Request allocation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Request allocation": {
+      "main": [
+        [
+          {
+            "node": "Bounded-change policy",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Bounded-change policy": {
+      "main": [
+        [
+          {
+            "node": "Build review request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build review request": {
+      "main": [
+        [
+          {
+            "node": "Claude review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude review": {
+      "main": [
+        [
+          {
+            "node": "Decide path",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decide path": {
+      "main": [
+        [
+          {
+            "node": "Auto-apply?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Auto-apply?": {
+      "main": [
+        [
+          {
+            "node": "Apply allocation",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Approval token",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply allocation": {
+      "main": [
+        [
+          {
+            "node": "Allocation applied notice",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Allocation applied notice": {
+      "main": [
+        [
+          {
+            "node": "Notify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approval token": {
+      "main": [
+        [
+          {
+            "node": "Stage allocation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage allocation": {
+      "main": [
+        [
+          {
+            "node": "Build approval message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build approval message": {
+      "main": [
+        [
+          {
+            "node": "Send approval request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send approval request": {
+      "main": [
+        [
+          {
+            "node": "Wait for approval",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait for approval": {
+      "main": [
+        [
+          {
+            "node": "Approval result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approval result": {
+      "main": [
+        [
+          {
+            "node": "Verify approval",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify approval": {
+      "main": [
+        [
+          {
+            "node": "Approval outcome notice",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approval outcome notice": {
+      "main": [
+        [
+          {
+            "node": "Notify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "UTC",
+    "saveDataErrorExecution": "all",
+    "saveManualExecutions": false,
+    "errorWorkflow": "AQOS13ErrorHandl",
+    "executionTimeout": 21600
+  },
+  "pinData": {},
+  "tags": [
+    {
+      "name": "aqos"
+    }
+  ],
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}

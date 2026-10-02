@@ -1,0 +1,316 @@
+{
+  "id": "AQOS13ErrorHandl",
+  "name": "AQOS-13 Error handler",
+  "active": false,
+  "nodes": [
+    {
+      "id": "ceb3b287-ea17-41e1-8699-3e735ebee580",
+      "name": "Workflow failed",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "e72c9677-48ee-491c-86bb-8c0bba90eef8",
+      "name": "Classify error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        280,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Classifies any workflow failure routed here by the n8n Error Trigger.\nconst CRITICAL = new Set(['AQOS03SignalCycl', 'AQOS04RiskGate00', 'AQOS05ExecDisptc', 'AQOS06Settlement', 'AQOS07RiskMonitr', 'AQOS14KillSwitch']);\nconst HIGH = new Set(['AQOS00Supervisor', 'AQOS01EventGatew', 'AQOS08PortfolioA']);\nconst TRANSIENT = /(ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|socket hang up|timed? ?out|\\b429\\b|\\b502\\b|\\b503\\b|\\b504\\b|Too Many Requests|overloaded)/i;\nconst e = $input.first().json;\nconst wf = e.workflow ?? {};\nconst ex = e.execution ?? {};\nconst err = ex.error ?? e.trigger?.error ?? {};\nconst node = ex.lastNodeExecuted ?? err.node?.name ?? 'trigger';\nconst message = String(err.message ?? 'unknown error').slice(0, 1500);\nconst transient = TRANSIENT.test(message) || TRANSIENT.test(String(err.description ?? ''));\nconst criticality = CRITICAL.has(wf.id) ? 'critical' : HIGH.has(wf.id) ? 'high' : 'normal';\nconst normalized = message.replace(/[0-9a-f]{8}-[0-9a-f-]{27,}/gi, '<uuid>').replace(/\\d+/g, '#').slice(0, 160);\nreturn [{\n  json: {\n    workflow_id: wf.id ?? 'unknown',\n    workflow_name: wf.name ?? 'unknown',\n    execution_id: ex.id ?? null,\n    execution_url: ex.url ?? null,\n    node,\n    message,\n    transient,\n    criticality,\n    fingerprint: `${wf.id ?? 'unknown'}:${node}:${normalized}`,\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "700a1ef9-2d1d-456c-8696-b5625471c7a3",
+      "name": "Record incident",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        560,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT ops.record_incident($1::jsonb) AS r",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ fingerprint: $json.fingerprint, workflow_id: $json.workflow_id, workflow_name: $json.workflow_name, node: $json.node, message: $json.message, window_s: 300 }) }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "aqosCredPgMain00",
+          "name": "AQOS Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "82d22a63-9992-48dd-8f42-a447ec90fc25",
+      "name": "Severity policy",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        840,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Severity from criticality, transience and recurrence. A SEV1 failure in a\n// path that guards capital puts the whole system in REDUCE_ONLY: if the\n// pipeline cannot be trusted, it may only reduce risk until a human looks.\nconst FAIL_SAFE = new Set(['AQOS04RiskGate00', 'AQOS05ExecDisptc', 'AQOS06Settlement', 'AQOS07RiskMonitr']);\nconst c = $('Classify error').first().json;\nconst r = $input.first().json.r ?? {};\nconst n = Number(r.occurrences_window ?? 1);\nlet severity = 'SEV3';\nif (c.criticality === 'critical') severity = !c.transient || n >= 3 ? 'SEV1' : 'SEV2';\nelse if (c.criticality === 'high') severity = !c.transient || n >= 5 ? 'SEV2' : 'SEV3';\nreturn [{\n  json: {\n    ...c,\n    severity,\n    occurrences_window: n,\n    incident_id: r.incident_id ?? null,\n    fail_safe_reduce_only: severity === 'SEV1' && FAIL_SAFE.has(c.workflow_id),\n    text: `[${severity}] ${c.workflow_name} > ${c.node}: ${c.message.slice(0, 300)} (x${n} in 5 min)${c.execution_url ? `\\n${c.execution_url}` : ''}`,\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "4b470c18-d8dd-44f0-8861-51f7790bfcf0",
+      "name": "Fail safe?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1120,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "07b832eb-68a1-4781-8a4a-80fdfcc694c4",
+              "leftValue": "={{ $json.fail_safe_reduce_only }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "97a71854-4e3f-438b-89ee-289749926255",
+      "name": "Escalate global mode",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1400,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT risk.apply_mode($1::jsonb) AS r",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ scope: 'global', scope_id: '*', mode: 'REDUCE_ONLY', reason: 'wf_failure:' + $('Severity policy').first().json.workflow_id, set_by: 'error_handler' }) }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "aqosCredPgMain00",
+          "name": "AQOS Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "f242b302-3c46-4f69-8523-ce5173267529",
+      "name": "Mirror mode flag",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        1680,
+        0
+      ],
+      "parameters": {
+        "operation": "set",
+        "key": "aqos:mode:global",
+        "value": "={{ $json.r.mode }}",
+        "keyType": "string",
+        "expire": false
+      },
+      "credentials": {
+        "redis": {
+          "id": "aqosCredRedis0000",
+          "name": "AQOS Redis"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 500
+    },
+    {
+      "id": "983ad4a5-a606-4f3e-861e-c6e25cb4f99e",
+      "name": "Notify?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1120,
+        150
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "e6c45e3e-176b-4886-8799-d4cd0f44d690",
+              "leftValue": "={{ $json.severity !== \"SEV3\" || $json.occurrences_window === 1 }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "4d9b7d60-89ef-4427-861d-87daae2b3783",
+      "name": "Notify",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.4,
+      "position": [
+        1400,
+        150
+      ],
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "AQOS16Notifier00",
+          "mode": "id"
+        },
+        "mode": "once",
+        "options": {
+          "waitForSubWorkflow": false
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Workflow failed": {
+      "main": [
+        [
+          {
+            "node": "Classify error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify error": {
+      "main": [
+        [
+          {
+            "node": "Record incident",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record incident": {
+      "main": [
+        [
+          {
+            "node": "Severity policy",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Severity policy": {
+      "main": [
+        [
+          {
+            "node": "Fail safe?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Notify?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fail safe?": {
+      "main": [
+        [
+          {
+            "node": "Escalate global mode",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Escalate global mode": {
+      "main": [
+        [
+          {
+            "node": "Mirror mode flag",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify?": {
+      "main": [
+        [
+          {
+            "node": "Notify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "UTC",
+    "saveDataErrorExecution": "all",
+    "saveManualExecutions": false,
+    "executionTimeout": 60
+  },
+  "pinData": {},
+  "tags": [
+    {
+      "name": "aqos"
+    }
+  ],
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}

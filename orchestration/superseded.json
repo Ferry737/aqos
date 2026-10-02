@@ -1,0 +1,10 @@
+{
+  "T-E-onboarding-billing-tests": [
+    "T-E1-onboarding-tests",
+    "T-E2-billing-tests"
+  ],
+  "T-I-plumbing-tests": [
+    "T-I1-gate-exec-tests",
+    "T-I2-monitor-tests"
+  ]
+}

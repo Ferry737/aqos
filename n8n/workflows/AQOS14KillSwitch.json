@@ -1,0 +1,1115 @@
+{
+  "id": "AQOS14KillSwitch",
+  "name": "AQOS-14 Kill switch",
+  "active": true,
+  "nodes": [
+    {
+      "id": "9a48c4e2-7388-43c4-8da4-2c1cedc58f42",
+      "name": "Ops kill webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "aqos/kill",
+        "authentication": "headerAuth",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "aqosCredOpsAuth00",
+          "name": "AQOS Ops Webhook Token"
+        }
+      },
+      "notes": "POST { scope, scope_id, action, reason, requested_by, approver_ids? }",
+      "notesInFlow": false
+    },
+    {
+      "id": "2ad4d8f7-2eba-4dde-8890-5303ad25e3c3",
+      "name": "Kill request (sub-workflow)",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        150
+      ],
+      "parameters": {
+        "inputSource": "passthrough"
+      }
+    },
+    {
+      "id": "33546f5d-a451-42d3-8e74-c5f104be34e5",
+      "name": "Normalize request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        280,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Normalises a kill request from either trigger: an authenticated webhook\n// (humans, ops tools, the client portal's \"pause my account\" button) or a\n// sub-workflow call (risk gate, risk monitor).\nconst it = $input.first().json;\nconst viaWebhook = it.body !== undefined && it.headers !== undefined;\nconst b = viaWebhook ? it.body ?? {} : it;\nconst scope = String(b.scope ?? 'global').toLowerCase();\nconst action = String(b.action ?? 'halt_new').toLowerCase();\nconst scopeId = scope === 'global' ? '*' : String(b.scope_id ?? '');\nconst valid = ['global', 'account', 'strategy', 'venue'].includes(scope)\n  && ['halt_new', 'cancel_all', 'flatten', 'reset'].includes(action)\n  && (scope === 'global' || scopeId.length > 0)\n  && (!viaWebhook || !!b.requested_by);\nconst minute = Math.floor(Date.now() / 60_000);\nreturn [{\n  json: {\n    valid,\n    via_webhook: viaWebhook,\n    request_id: String(b.request_id ?? `${viaWebhook ? 'ops' : 'auto'}:${scope}:${scopeId}:${action}:${minute}`).slice(0, 200),\n    scope,\n    scope_id: scopeId,\n    action,\n    reason: String(b.reason ?? 'unspecified').slice(0, 300),\n    requested_by: String(b.requested_by ?? 'system').slice(0, 80),\n    approver_ids: Array.isArray(b.approver_ids) ? [...new Set(b.approver_ids.map(String))].slice(0, 5) : [],\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "70ab6a99-a9ca-439d-8063-4bddddc22c3b",
+      "name": "Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        560,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "cad9feaf-ca5d-4550-8a45-799c34c5f36f",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "2dc6518a-86ee-4c81-8aef-97df9e692720",
+      "name": "Reject notice",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.5,
+      "position": [
+        1680,
+        0
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "",
+              "name": "severity",
+              "value": "SEV2",
+              "type": "string"
+            },
+            {
+              "id": "",
+              "name": "text",
+              "value": "={{ \"[KILL REJECTED] invalid or unauthorised request \" + $(\"Normalize request\").first().json.request_id }}",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": false,
+        "options": {}
+      }
+    },
+    {
+      "id": "77450833-95f7-4a45-8a9e-20a987e032e1",
+      "name": "Reset or kill",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        840,
+        0
+      ],
+      "parameters": {
+        "mode": "rules",
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "1bc864c5-993e-4ca4-8a54-e426c2c39ec6",
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "reset",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "reset"
+            }
+          ]
+        },
+        "looseTypeValidation": true,
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "kill"
+        }
+      }
+    },
+    {
+      "id": "3afc4c7e-64b3-43eb-8a6b-befae566229e",
+      "name": "Four-eyes check",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Lifting a halt needs two distinct approvers (the database re-checks this).\nconst r = $('Normalize request').first().json;\nconst approvers = [...new Set(r.approver_ids)];\nconst ok = approvers.length >= 2;\nreturn [{ json: { ...r, approver_ids: approvers, four_eyes_ok: ok, reason_text: ok ? null : 'reset requires two distinct approver_ids' } }];\n"
+      }
+    },
+    {
+      "id": "61c52d6c-691c-4b65-8397-3ad894641ac1",
+      "name": "Two approvers?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1400,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "fa93e704-371e-4d87-8f10-339b97f04def",
+              "leftValue": "={{ $json.four_eyes_ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "8c3bb7b9-600d-4425-84fd-772b1b60b000",
+      "name": "Apply reset",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1680,
+        150
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT risk.apply_mode($1::jsonb) AS r",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ scope: $json.scope, scope_id: $json.scope_id, mode: 'NORMAL', reason: 'reset:' + $json.reason, set_by: $json.requested_by, allow_deescalate: true, approver_ids: $json.approver_ids }) }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "aqosCredPgMain00",
+          "name": "AQOS Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "13ed9528-9b8c-4f83-854a-fc945eccc86c",
+      "name": "Reset is global?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1960,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "27c28413-e2d6-4820-8d22-71d93260313d",
+              "leftValue": "={{ $(\"Normalize request\").first().json.scope }}",
+              "rightValue": "global",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "4f0eda97-7efc-473e-8f8c-3d4fb819b778",
+      "name": "Mirror reset to flag",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        2240,
+        0
+      ],
+      "parameters": {
+        "operation": "set",
+        "key": "aqos:mode:global",
+        "value": "={{ $json.r.mode }}",
+        "keyType": "string",
+        "expire": false
+      },
+      "credentials": {
+        "redis": {
+          "id": "aqosCredRedis0000",
+          "name": "AQOS Redis"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 500
+    },
+    {
+      "id": "142733a2-8ff1-4e75-869f-6d0243ad0a48",
+      "name": "Reset notice",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.5,
+      "position": [
+        2520,
+        0
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "",
+              "name": "severity",
+              "value": "SEV2",
+              "type": "string"
+            },
+            {
+              "id": "",
+              "name": "text",
+              "value": "={{ \"[RESET] \" + $(\"Normalize request\").first().json.scope + \":\" + $(\"Normalize request\").first().json.scope_id + \" -> \" + $(\"Apply reset\").first().json.r.mode + \" approved by \" + $(\"Normalize request\").first().json.approver_ids.join(\" + \") }}",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": false,
+        "options": {}
+      }
+    },
+    {
+      "id": "983ba487-b6e3-4495-8a21-280d9958f942",
+      "name": "Record kill request",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1120,
+        150
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT ops.record_kill_request($1::jsonb) AS r",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify($(\"Normalize request\").first().json) }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "aqosCredPgMain00",
+          "name": "AQOS Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "2e649a88-2a4b-49d1-8bb4-cd4c4c06d9d4",
+      "name": "Duplicate?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1400,
+        150
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "bb4f8be7-08be-488f-821d-1d23f2c52119",
+              "leftValue": "={{ $json.r.duplicate }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "f71b4f8a-765c-4f4f-8cae-a5fdb2b4291f",
+      "name": "Duplicate ignored",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1680,
+        300
+      ],
+      "parameters": {},
+      "notes": "Same request_id already processed: nothing to do",
+      "notesInFlow": false
+    },
+    {
+      "id": "41aaf83d-773b-4f31-8dba-8f990cb2d57c",
+      "name": "Set halt mode",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1680,
+        450
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT risk.apply_mode($1::jsonb) AS r",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ scope: $(\"Normalize request\").first().json.scope, scope_id: $(\"Normalize request\").first().json.scope_id, mode: 'HALT', reason: 'kill:' + $(\"Normalize request\").first().json.action + ':' + $(\"Normalize request\").first().json.reason, set_by: $(\"Normalize request\").first().json.requested_by }) }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "aqosCredPgMain00",
+          "name": "AQOS Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "ec725816-5d84-4bae-8686-3329b634bb53",
+      "name": "Kill is global?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1960,
+        150
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "3e2696d3-7365-424b-8e89-d289dd0ebb57",
+              "leftValue": "={{ $(\"Normalize request\").first().json.scope }}",
+              "rightValue": "global",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "38cc766b-fe58-474f-817d-2cbc5c566921",
+      "name": "Mirror halt to flag",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        2240,
+        150
+      ],
+      "parameters": {
+        "operation": "set",
+        "key": "aqos:mode:global",
+        "value": "={{ $json.r.mode }}",
+        "keyType": "string",
+        "expire": false
+      },
+      "credentials": {
+        "redis": {
+          "id": "aqosCredRedis0000",
+          "name": "AQOS Redis"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 500
+    },
+    {
+      "id": "16ef8c18-240b-452b-8ede-7593b919884f",
+      "name": "Call EMS kill",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        16240,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://ems:8080/v1/kill",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ request_id: $(\"Normalize request\").first().json.request_id, scope: $(\"Normalize request\").first().json.scope, scope_id: $(\"Normalize request\").first().json.scope_id, action: $(\"Normalize request\").first().json.action, reason: $(\"Normalize request\").first().json.reason }) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "aqosCredEmsAuth00",
+          "name": "AQOS EMS Token"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500,
+      "onError": "continueRegularOutput",
+      "notes": "Idempotent on request_id. The EMS also arms exchange-side cancel-all-after (dead-man switches).",
+      "notesInFlow": false
+    },
+    {
+      "id": "e7d6c28a-0cc6-4061-82cb-a3e8c979cd7b",
+      "name": "Check EMS exposure",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        16520,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://ems:8080/v1/exposure",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ scope: $(\"Normalize request\").first().json.scope, scope_id: $(\"Normalize request\").first().json.scope_id }) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "aqosCredEmsAuth00",
+          "name": "AQOS EMS Token"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "ac0bbe5d-8cac-429d-8760-5379edc35db7",
+      "name": "Verify exposure",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        14840,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Verifies the EMS really is flat for the scope: no open orders, and for a\n// flatten, residual notional below dust on every venue.\nconst DUST_USD = 25;\nconst req = $('Normalize request').first().json;\nconst x = $input.first().json ?? {};\nconst openOrders = Number(x.open_orders ?? NaN);\nconst residual = Number(x.gross_notional_usd ?? NaN);\nconst ordersClean = openOrders === 0;\nconst positionsClean = req.action !== 'flatten' || (Number.isFinite(residual) && residual <= DUST_USD);\nreturn [{\n  json: {\n    ...req,\n    clean: ordersClean && positionsClean,\n    severity: ordersClean && positionsClean ? 'SEV2' : 'SEV1',\n    open_orders: Number.isFinite(openOrders) ? openOrders : null,\n    residual_gross_usd: Number.isFinite(residual) ? residual : null,\n    text: `[KILL ${req.action.toUpperCase()}] ${req.scope}:${req.scope_id} - open orders ${Number.isFinite(openOrders) ? openOrders : '?'}, `\n      + `residual gross USD ${Number.isFinite(residual) ? residual.toFixed(2) : '?'} (${req.reason})`,\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "db6bbcee-f3e6-41a4-8264-6709a978627b",
+      "name": "Clean?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        15120,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "a05b36b5-58cc-4dd1-89a8-3fa68bdfb279",
+              "leftValue": "={{ $json.clean }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "bc1df570-d65b-4d82-8e4f-23f8a95ab572",
+      "name": "Retry budget",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        15400,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Up to three kill attempts within one execution, then escalate to a human.\nconst MAX_ATTEMPTS = 3;\nconst v = $input.first().json;\nconst attempt = $runIndex + 1;\nreturn [{ json: { ...v, attempt, retry: attempt < MAX_ATTEMPTS } }];\n"
+      }
+    },
+    {
+      "id": "2e713ae7-cdc8-47fa-8dbc-fd91a5796a76",
+      "name": "Retry?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        15680,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "15453b5a-a96f-4a65-8271-4848c92fa2a5",
+              "leftValue": "={{ $json.retry }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "2df92638-b374-4041-891b-22f90adc7f08",
+      "name": "Backoff",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        15960,
+        0
+      ],
+      "parameters": {
+        "resume": "timeInterval",
+        "amount": 3,
+        "unit": "seconds"
+      }
+    },
+    {
+      "id": "92e9aa54-50a8-4b7c-8b67-f502ed061c09",
+      "name": "Complete request",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        15960,
+        150
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT ops.complete_kill_request($1::jsonb) AS r",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ request_id: $json.request_id, status: $json.clean ? 'DONE' : 'FAILED', result: { clean: $json.clean, open_orders: $json.open_orders, residual_gross_usd: $json.residual_gross_usd } }) }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "aqosCredPgMain00",
+          "name": "AQOS Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "6d2d59d2-dc63-4309-8bad-ad34bafc25f8",
+      "name": "Kill report",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.5,
+      "position": [
+        16240,
+        150
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "",
+              "name": "severity",
+              "value": "={{ $(\"Verify exposure\").first().json.clean ? \"SEV2\" : \"SEV1\" }}",
+              "type": "string"
+            },
+            {
+              "id": "",
+              "name": "text",
+              "value": "={{ $(\"Verify exposure\").first().json.text + ($(\"Verify exposure\").first().json.clean ? \" - CONFIRMED\" : \" - NOT CONFIRMED, HUMAN ACTION REQUIRED\") }}",
+              "type": "string"
+            }
+          ]
+        },
+        "includeOtherFields": false,
+        "options": {}
+      }
+    },
+    {
+      "id": "19804c3a-febc-4da4-85e2-319891732890",
+      "name": "Notify",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.4,
+      "position": [
+        16520,
+        150
+      ],
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "AQOS16Notifier00",
+          "mode": "id"
+        },
+        "mode": "once",
+        "options": {
+          "waitForSubWorkflow": false
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Ops kill webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalize request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Kill request (sub-workflow)": {
+      "main": [
+        [
+          {
+            "node": "Normalize request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize request": {
+      "main": [
+        [
+          {
+            "node": "Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Valid?": {
+      "main": [
+        [
+          {
+            "node": "Reset or kill",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reject notice",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reject notice": {
+      "main": [
+        [
+          {
+            "node": "Notify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reset or kill": {
+      "main": [
+        [
+          {
+            "node": "Four-eyes check",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record kill request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Four-eyes check": {
+      "main": [
+        [
+          {
+            "node": "Two approvers?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Two approvers?": {
+      "main": [
+        [
+          {
+            "node": "Apply reset",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reject notice",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply reset": {
+      "main": [
+        [
+          {
+            "node": "Reset is global?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reset is global?": {
+      "main": [
+        [
+          {
+            "node": "Mirror reset to flag",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reset notice",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mirror reset to flag": {
+      "main": [
+        [
+          {
+            "node": "Reset notice",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reset notice": {
+      "main": [
+        [
+          {
+            "node": "Notify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record kill request": {
+      "main": [
+        [
+          {
+            "node": "Duplicate?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Duplicate?": {
+      "main": [
+        [
+          {
+            "node": "Duplicate ignored",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Set halt mode",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set halt mode": {
+      "main": [
+        [
+          {
+            "node": "Kill is global?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Kill is global?": {
+      "main": [
+        [
+          {
+            "node": "Mirror halt to flag",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Call EMS kill",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mirror halt to flag": {
+      "main": [
+        [
+          {
+            "node": "Call EMS kill",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call EMS kill": {
+      "main": [
+        [
+          {
+            "node": "Check EMS exposure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check EMS exposure": {
+      "main": [
+        [
+          {
+            "node": "Verify exposure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify exposure": {
+      "main": [
+        [
+          {
+            "node": "Clean?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clean?": {
+      "main": [
+        [
+          {
+            "node": "Complete request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Retry budget",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retry budget": {
+      "main": [
+        [
+          {
+            "node": "Retry?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retry?": {
+      "main": [
+        [
+          {
+            "node": "Backoff",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Complete request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Backoff": {
+      "main": [
+        [
+          {
+            "node": "Call EMS kill",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Complete request": {
+      "main": [
+        [
+          {
+            "node": "Kill report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Kill report": {
+      "main": [
+        [
+          {
+            "node": "Notify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "UTC",
+    "saveDataErrorExecution": "all",
+    "saveManualExecutions": false,
+    "errorWorkflow": "AQOS13ErrorHandl",
+    "executionTimeout": 300
+  },
+  "pinData": {},
+  "tags": [
+    {
+      "name": "aqos"
+    }
+  ],
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}

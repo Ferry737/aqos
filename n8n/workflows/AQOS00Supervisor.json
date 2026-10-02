@@ -1,0 +1,607 @@
+{
+  "id": "AQOS00Supervisor",
+  "name": "AQOS-00 Supervisor",
+  "active": true,
+  "nodes": [
+    {
+      "id": "c59a397d-3033-4f59-8b2f-bf54ed89b665",
+      "name": "Every 30 s",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "seconds",
+              "secondsInterval": 30
+            }
+          ]
+        },
+        "misfirePolicy": "skip",
+        "misfireGraceSeconds": 0
+      }
+    },
+    {
+      "id": "7497c1e3-dc4c-4003-8453-905422745db6",
+      "name": "Service registry",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        280,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Services the supervisor probes every 30 s. critical=true: trading cannot\n// continue safely without it. Hostnames are the docker/k8s service names.\nconst services = [\n  { name: 'stream-gateway', url: 'http://stream-gw:8080/healthz', critical: true },\n  { name: 'model-service', url: 'http://model-svc:8080/healthz', critical: false },\n  { name: 'portfolio-service', url: 'http://portfolio-svc:8080/healthz', critical: false },\n  { name: 'risk-service', url: 'http://risk-svc:8080/healthz', critical: true },\n  { name: 'ems-primary', url: 'http://ems:8080/healthz', critical: true },\n  { name: 'ems-standby', url: 'http://ems-standby:8080/healthz', critical: false },\n];\nreturn services.map((s) => ({ json: s }));\n"
+      }
+    },
+    {
+      "id": "2dd834f6-ca77-423f-8f3b-ac742bf91951",
+      "name": "Probe /healthz",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        560,
+        0
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.url }}",
+        "authentication": "none",
+        "options": {
+          "timeout": 5000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "0ffe2f66-0790-4467-8858-d2d32fea7059",
+      "name": "Freshness report",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        840,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT ops.freshness_report($1::jsonb) AS r",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({}) }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "aqosCredPgMain00",
+          "name": "AQOS Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000,
+      "executeOnce": true
+    },
+    {
+      "id": "73e2f339-586b-4a0c-8f88-2b74e9d12ce0",
+      "name": "Current global mode",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        1120,
+        0
+      ],
+      "parameters": {
+        "operation": "get",
+        "propertyName": "global_mode",
+        "key": "aqos:mode:global",
+        "keyType": "string"
+      },
+      "credentials": {
+        "redis": {
+          "id": "aqosCredRedis0000",
+          "name": "AQOS Redis"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 500,
+      "executeOnce": true
+    },
+    {
+      "id": "120c9d61-2ba9-4e17-8386-6c5ad766b4fb",
+      "name": "Evaluate system state",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1400,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Turns health probes and database freshness into one system state.\n// Policies: no trustworthy market data -> no new signals (dq DEGRADED);\n// no risk monitoring -> no new risk (escalate global mode to REDUCE_ONLY).\n// The supervisor can only escalate; the database ratchet enforces that too.\nconst P = {\n  maxCriticalBarAgeS: 150,\n  maxMarkAgeS: 15,\n  maxRiskMonitorAgeS: 90,\n  maxReconAgeS: 300,\n};\nconst RANK = { NORMAL: 0, REDUCE_ONLY: 1, HALT: 2 };\nconst normMode = (m) => {\n  const u = String(m ?? 'NORMAL').toUpperCase();\n  return u in RANK ? u : 'HALT';\n};\n\nfunction evaluate(probes, fresh, currentMode, nowIso) {\n  const components = {};\n  for (const p of probes) {\n    const up = p.statusCode >= 200 && p.statusCode < 300;\n    components[p.name] = { up, critical: p.critical, status: p.statusCode ?? null, error: up ? null : p.error ?? `http_${p.statusCode}` };\n  }\n  const hb = fresh.heartbeat_age_s ?? {};\n  const issues = [];\n  const add = (sev, code, detail) => issues.push(detail === undefined ? { sev, code } : { sev, code, detail });\n\n  const gatewayUp = components['stream-gateway']?.up === true;\n  const feedsStale = fresh.max_critical_bar_age_s == null || Number(fresh.max_critical_bar_age_s) > P.maxCriticalBarAgeS;\n  const marksStale = fresh.max_mark_age_s == null || Number(fresh.max_mark_age_s) > P.maxMarkAgeS;\n  const quarantined = Number(fresh.quarantined_critical ?? 0);\n  if (!gatewayUp) add('SEV1', 'stream_gateway_down');\n  if (feedsStale) add('SEV2', 'critical_feeds_stale', fresh.max_critical_bar_age_s);\n  if (marksStale) add('SEV2', 'marks_stale', fresh.max_mark_age_s);\n  if (quarantined > 0) add('SEV2', 'critical_feed_quarantined', quarantined);\n  const dqStatus = gatewayUp && !feedsStale && !marksStale && quarantined === 0 ? 'OK' : 'DEGRADED';\n\n  if (!components['ems-primary']?.up) {\n    add(components['ems-standby']?.up ? 'SEV2' : 'SEV1', 'ems_primary_down', { standby_up: components['ems-standby']?.up === true });\n  }\n  if (!components['risk-service']?.up) add('SEV2', 'risk_service_down_fallback_active');\n  if (!components['model-service']?.up) add('SEV2', 'model_service_down_signals_paused');\n  const riskAge = hb.risk_monitor;\n  const riskBlind = riskAge == null || Number(riskAge) > P.maxRiskMonitorAgeS;\n  if (riskBlind) add('SEV1', 'risk_monitor_blind', riskAge ?? null);\n  const reconAge = hb.reconciliation;\n  if (reconAge == null || Number(reconAge) > P.maxReconAgeS) add('SEV2', 'reconciliation_stale', reconAge ?? null);\n  if (Number(fresh.open_high_breaks ?? 0) > 0) add('SEV2', 'open_high_recon_breaks', fresh.open_high_breaks);\n  if (Number(fresh.unconfirmed_orders ?? 0) > 0) add('SEV1', 'orders_send_unconfirmed', fresh.unconfirmed_orders);\n\n  const escalateTo = riskBlind && RANK[currentMode] < RANK.REDUCE_ONLY ? 'REDUCE_ONLY' : null;\n  const severity = issues.some((i) => i.sev === 'SEV1') ? 'SEV1' : issues.some((i) => i.sev === 'SEV2') ? 'SEV2' : 'OK';\n  const fingerprint = [dqStatus, escalateTo ?? '-', ...issues.map((i) => i.code).sort()].join('|');\n  return { ts: nowIso, dq_status: dqStatus, global_mode: currentMode, escalate_to: escalateTo, severity, issues, components, fingerprint };\n}\n\n// ---- n8n glue -------------------------------------------------------------\nconst registry = $('Service registry').all();\nconst results = $('Probe /healthz').all();\nconst probes = registry.map((s, i) => {\n  const r = results[i]?.json ?? {};\n  return { ...s.json, statusCode: r.statusCode ?? null, error: r.error ? String(r.error.message ?? r.error) : null };\n});\nconst fresh = $('Freshness report').first().json.r ?? {};\n// Use the more severe of the fast flag (Redis) and the system of record (DB).\nconst redisMode = normMode($('Current global mode').first().json.global_mode ?? 'NORMAL');\nconst dbMode = normMode(fresh.global_mode ?? 'NORMAL');\nconst mode = RANK[redisMode] >= RANK[dbMode] ? redisMode : dbMode;\nreturn [{ json: evaluate(probes, fresh, mode, new Date().toISOString()) }];\n"
+      }
+    },
+    {
+      "id": "5ad89b6e-8102-45fa-8771-e7654e1e3e61",
+      "name": "Write dq status",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        1680,
+        0
+      ],
+      "parameters": {
+        "operation": "set",
+        "key": "aqos:dq:status",
+        "value": "={{ $json.dq_status }}",
+        "keyType": "string",
+        "expire": false
+      },
+      "credentials": {
+        "redis": {
+          "id": "aqosCredRedis0000",
+          "name": "AQOS Redis"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 500
+    },
+    {
+      "id": "80eb0405-d992-4235-8f8d-c576d5e4fae0",
+      "name": "Write global mode flag",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        1960,
+        0
+      ],
+      "parameters": {
+        "operation": "set",
+        "key": "aqos:mode:global",
+        "value": "={{ $(\"Evaluate system state\").first().json.global_mode }}",
+        "keyType": "string",
+        "expire": false
+      },
+      "credentials": {
+        "redis": {
+          "id": "aqosCredRedis0000",
+          "name": "AQOS Redis"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 500
+    },
+    {
+      "id": "2ebb04b4-6bf3-4f92-8d08-8da38c30344a",
+      "name": "Last fingerprint",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        2240,
+        0
+      ],
+      "parameters": {
+        "operation": "get",
+        "propertyName": "last_fingerprint",
+        "key": "aqos:sup:last_fp",
+        "keyType": "string"
+      },
+      "credentials": {
+        "redis": {
+          "id": "aqosCredRedis0000",
+          "name": "AQOS Redis"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 500,
+      "executeOnce": true
+    },
+    {
+      "id": "4d480033-c1bd-4298-87fa-516882e22996",
+      "name": "Detect change",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2520,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Alerts on state transitions only, so a persistent problem pages once,\n// and a recovery is announced once.\nconst cur = $('Evaluate system state').first().json;\nconst last = $input.first().json.last_fingerprint ?? null;\nconst changed = last !== cur.fingerprint;\nconst lines = cur.issues.map((i) => `- ${i.sev} ${i.code}${i.detail !== undefined ? ` (${JSON.stringify(i.detail)})` : ''}`);\nconst text = cur.severity === 'OK'\n  ? `[RECOVERED] AQOS: all supervisor checks passing (${cur.ts})`\n  : `[${cur.severity}] AQOS supervisor: data ${cur.dq_status}, global mode ${cur.escalate_to ?? cur.global_mode}\\n${lines.join('\\n')}`;\nconst notify = changed && (cur.severity !== 'OK' || last !== null);\nreturn [{ json: { ...cur, changed, notify, text } }];\n"
+      }
+    },
+    {
+      "id": "ff51cf8c-1526-4c77-8527-46f9162e4f37",
+      "name": "Escalate?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        2800,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "ee70271a-a8e8-4794-8c55-d265022e7ef4",
+              "leftValue": "={{ $json.escalate_to }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "cfb4062e-276a-4489-8164-b68e58d35f89",
+      "name": "Apply escalation",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        3080,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT risk.apply_mode($1::jsonb) AS r",
+        "options": {
+          "queryReplacement": "={{ JSON.stringify({ scope: 'global', scope_id: '*', mode: $('Detect change').first().json.escalate_to, reason: 'supervisor:risk_monitor_blind', set_by: 'supervisor' }) }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "aqosCredPgMain00",
+          "name": "AQOS Postgres"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "216b4257-d816-44c0-8098-3a65ed4b416c",
+      "name": "Mirror escalation",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        3360,
+        0
+      ],
+      "parameters": {
+        "operation": "set",
+        "key": "aqos:mode:global",
+        "value": "={{ $json.r.mode }}",
+        "keyType": "string",
+        "expire": false
+      },
+      "credentials": {
+        "redis": {
+          "id": "aqosCredRedis0000",
+          "name": "AQOS Redis"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 500
+    },
+    {
+      "id": "ab06b9fa-3cda-4931-8988-cf3447668fe6",
+      "name": "Notify?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        2800,
+        150
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "4fd878af-5d44-43f1-8790-6f970c22a956",
+              "leftValue": "={{ $json.notify }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "d88823d5-cdb9-459d-81aa-b3e9cd50a280",
+      "name": "Save fingerprint",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [
+        3080,
+        150
+      ],
+      "parameters": {
+        "operation": "set",
+        "key": "aqos:sup:last_fp",
+        "value": "={{ $(\"Detect change\").first().json.fingerprint }}",
+        "keyType": "string",
+        "expire": false
+      },
+      "credentials": {
+        "redis": {
+          "id": "aqosCredRedis0000",
+          "name": "AQOS Redis"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 500
+    },
+    {
+      "id": "59a24a1f-888e-4490-8175-8db51691c701",
+      "name": "Notify",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.4,
+      "position": [
+        3360,
+        150
+      ],
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "AQOS16Notifier00",
+          "mode": "id"
+        },
+        "mode": "once",
+        "options": {
+          "waitForSubWorkflow": false
+        }
+      }
+    },
+    {
+      "id": "a11e7979-e3c3-4952-8cff-84254d125476",
+      "name": "Dead-man ping",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        2800,
+        300
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://hc-ping.example.com/REPLACE",
+        "authentication": "none",
+        "options": {
+          "timeout": 5000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "External dead-man switch: alerts if this stops arriving.",
+      "notesInFlow": false
+    }
+  ],
+  "connections": {
+    "Every 30 s": {
+      "main": [
+        [
+          {
+            "node": "Service registry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Service registry": {
+      "main": [
+        [
+          {
+            "node": "Probe /healthz",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Probe /healthz": {
+      "main": [
+        [
+          {
+            "node": "Freshness report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Freshness report": {
+      "main": [
+        [
+          {
+            "node": "Current global mode",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Current global mode": {
+      "main": [
+        [
+          {
+            "node": "Evaluate system state",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluate system state": {
+      "main": [
+        [
+          {
+            "node": "Write dq status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write dq status": {
+      "main": [
+        [
+          {
+            "node": "Write global mode flag",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write global mode flag": {
+      "main": [
+        [
+          {
+            "node": "Last fingerprint",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Last fingerprint": {
+      "main": [
+        [
+          {
+            "node": "Detect change",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Detect change": {
+      "main": [
+        [
+          {
+            "node": "Escalate?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Notify?",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Dead-man ping",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Escalate?": {
+      "main": [
+        [
+          {
+            "node": "Apply escalation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply escalation": {
+      "main": [
+        [
+          {
+            "node": "Mirror escalation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify?": {
+      "main": [
+        [
+          {
+            "node": "Save fingerprint",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save fingerprint": {
+      "main": [
+        [
+          {
+            "node": "Notify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "UTC",
+    "saveDataErrorExecution": "all",
+    "saveManualExecutions": false,
+    "errorWorkflow": "AQOS13ErrorHandl",
+    "executionTimeout": 60,
+    "saveDataSuccessExecution": "none"
+  },
+  "pinData": {},
+  "tags": [
+    {
+      "name": "aqos"
+    }
+  ],
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}

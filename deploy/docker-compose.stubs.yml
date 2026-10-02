@@ -1,0 +1,42 @@
+# AQOS stub services: a dry-run stand-in for the seven custom services the n8n
+# workflows call (stream-gw, model-svc, portfolio-svc, risk-svc, ems,
+# ems-standby, data-adapter). One process answers for all seven hostnames and
+# implements the thirteen endpoints of CONTRACTS.md deterministically, so a
+# dry run is reproducible.
+#
+#   docker compose -f deploy/docker-compose.yml up -d            # creates the network
+#   docker compose -f deploy/docker-compose.stubs.yml up -d
+#
+# The network below is the *default* network of the compose project "aqos",
+# i.e. "aqos_default", which `deploy/docker-compose.yml` already created.
+# `external: true` joins that existing network instead of creating a second
+# one, so the n8n containers reach the stubs under the service hostnames above
+# (http://stream-gw:8080, http://ems:8080, ...). No compose project name or
+# file layout is assumed beyond that: the network is referenced by name.
+services:
+  stubs:
+    image: node:22
+    working_dir: /workspace
+    command: ["node", "tools/stub-services.mjs"]
+    environment:
+      PORT: "8080"
+      STUB_TOKEN: ${STUB_TOKEN:-stub-token}
+    volumes:
+      - ../:/workspace:ro
+    ports:
+      - "8080:8080"
+    networks:
+      default:
+        aliases:
+          - stream-gw
+          - model-svc
+          - portfolio-svc
+          - risk-svc
+          - ems
+          - ems-standby
+          - data-adapter
+
+networks:
+  default:
+    name: aqos_default
+    external: true
